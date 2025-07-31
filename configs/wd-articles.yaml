@@ -1,0 +1,26 @@
+encoder_type: transformer
+decoder_type: transformer
+d_model: 512
+d_hidden: 512
+d_latent: 512
+n_layers: 4
+n_heads: 8
+d_ff: 2048
+dropout: 0.1
+
+batch_size: 512
+learning_rate: 0.0002
+num_epochs: 800
+beta: 0.000001
+gamma: 10.0
+zeta: 1.0
+
+dataset: wd-articles
+max_nodes: 100
+max_edges: 50
+
+lr_scheduler: true
+save_every: 50
+num_workers: 4
+
+experiment_name: kgvae_wd_articles_transformer
