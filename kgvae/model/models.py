@@ -160,7 +160,8 @@ class ScoringFunction(nn.Module):
     def __init__(self, n_entities, n_relations, d_model):
         super().__init__()
         self.entity_embeddings = nn.Embedding(n_entities, d_model)
-        self.relation_embeddings = nn.Embedding(n_relations, d_model, d_model)
+        # self.relation_embeddings = nn.Embedding(n_relations, d_model, d_model)
+        self.relation_embeddings = nn.Embedding(n_relations, d_model)
         
     def forward(self, subjects, relations, objects):
         s_embed = self.entity_embeddings(subjects)

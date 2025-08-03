@@ -14,7 +14,8 @@ def compute_reconstruction_loss(logits, targets, mask=None):
     relation_loss = F.cross_entropy(relation_logits.reshape(-1, relation_logits.size(-1)), relation_targets.reshape(-1), reduction='none')
     object_loss = F.cross_entropy(object_logits.reshape(-1, object_logits.size(-1)), object_targets.reshape(-1), reduction='none')
     
-    total_loss = subject_loss + relation_loss + object_loss
+    # total_loss = subject_loss + relation_loss + object_loss
+    total_loss = torch.cat([subject_loss, relation_loss, object_loss], dim=0) 
     
     if mask is not None:
         mask = mask.reshape(-1)
@@ -22,7 +23,8 @@ def compute_reconstruction_loss(logits, targets, mask=None):
         return total_loss.sum() / mask.sum()
     else:
         return total_loss.mean()
-
+    
+    
 
 def pad_triples(triples, max_edges, pad_value=0):
     batch_size, n_triples, _ = triples.shape
@@ -36,9 +38,17 @@ def pad_triples(triples, max_edges, pad_value=0):
     return padded_triples
 
 
+
+
+# def create_padding_mask(triples, pad_value=0):
+#     mask = (triples[:, :, 0] != pad_value).float()
+#     return mask
 def create_padding_mask(triples, pad_value=0):
-    mask = (triples[:, :, 0] != pad_value).float()
-    return mask
+    B, N, _ = triples.shape
+    flat = triples.view(B, -1)  
+    mask = (flat != pad_value).float()
+    return mask 
+
 
 
 def compute_entity_sorting_loss(entity_logits, sorted_entities, mask=None):
