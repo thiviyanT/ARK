@@ -1,37 +1,46 @@
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
 import wandb
 import yaml
 import argparse
 import os
 from tqdm import tqdm
-from intelligraphs.data_loaders import load_data_as_list
+import numpy as np
+
+from intelligraphs import DataLoader
+from intelligraphs.data_loaders import DatasetDownloader
 
 from kgvae.model.models import KGVAE
 from kgvae.model.utils import (
     compute_kl_divergence,
     compute_reconstruction_loss,
-    pad_triples,
     create_padding_mask,
-    compute_entity_sorting_loss
 )
 
 
-class KGDataset(Dataset):
-    def __init__(self, triples, max_edges):
-        self.triples = triples
-        self.max_edges = max_edges
-        
-    def __len__(self):
-        return len(self.triples)
-        
-    def __getitem__(self, idx):
-        triple_set = self.triples[idx]
-        padded_triples = pad_triples(triple_set.unsqueeze(0), self.max_edges).squeeze(0)
-        mask = create_padding_mask(padded_triples.unsqueeze(0)).squeeze(0)
-        
-        return padded_triples, mask
+def process_batch(batch_triples, max_edges, device):
+    """
+    Process a batch of triples from IntelliGraphs DataLoader.
+    """
+    # batch_triples is already a tensor from IntelliGraphs
+    batch_size = batch_triples.size(0)
+    
+    # Pad/truncate to max_edges
+    current_edges = batch_triples.size(1)
+    
+    if current_edges > max_edges:
+        # Truncate
+        batch_triples = batch_triples[:, :max_edges, :]
+    elif current_edges < max_edges:
+        # Pad with zeros
+        padding = torch.zeros(batch_size, max_edges - current_edges, 3, 
+                             dtype=batch_triples.dtype, device=batch_triples.device)
+        batch_triples = torch.cat([batch_triples, padding], dim=1)
+    
+    # Create mask for padding
+    mask = create_padding_mask(batch_triples)
+    
+    return batch_triples, mask
 
 
 def train_epoch(model, dataloader, optimizer, config, device):
@@ -39,8 +48,11 @@ def train_epoch(model, dataloader, optimizer, config, device):
     total_loss = 0
     total_recon_loss = 0
     total_kl_loss = 0
+    num_batches = 0
     
-    for batch_idx, (triples, mask) in enumerate(tqdm(dataloader, desc="Training")):
+    for batch_idx, batch_triples in enumerate(tqdm(dataloader, desc="Training")):
+        # Process batch from IntelliGraphs DataLoader
+        triples, mask = process_batch(batch_triples, config['max_edges'], device)
         triples = triples.to(device)
         mask = mask.to(device)
         
@@ -64,10 +76,11 @@ def train_epoch(model, dataloader, optimizer, config, device):
         total_loss += loss.item()
         total_recon_loss += recon_loss.item()
         total_kl_loss += kl_loss.item()
+        num_batches += 1
         
-    avg_loss = total_loss / len(dataloader)
-    avg_recon_loss = total_recon_loss / len(dataloader)
-    avg_kl_loss = total_kl_loss / len(dataloader)
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0
+    avg_recon_loss = total_recon_loss / num_batches if num_batches > 0 else 0
+    avg_kl_loss = total_kl_loss / num_batches if num_batches > 0 else 0
     
     return avg_loss, avg_recon_loss, avg_kl_loss
 
@@ -77,9 +90,12 @@ def validate(model, dataloader, config, device):
     total_loss = 0
     total_recon_loss = 0
     total_kl_loss = 0
+    num_batches = 0
     
     with torch.no_grad():
-        for triples, mask in tqdm(dataloader, desc="Validation"):
+        for batch_triples in tqdm(dataloader, desc="Validation"):
+            # Process batch from IntelliGraphs DataLoader
+            triples, mask = process_batch(batch_triples, config['max_edges'], device)
             triples = triples.to(device)
             mask = mask.to(device)
             
@@ -98,10 +114,11 @@ def validate(model, dataloader, config, device):
             total_loss += loss.item()
             total_recon_loss += recon_loss.item()
             total_kl_loss += kl_loss.item()
+            num_batches += 1
             
-    avg_loss = total_loss / len(dataloader)
-    avg_recon_loss = total_recon_loss / len(dataloader)
-    avg_kl_loss = total_kl_loss / len(dataloader)
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0
+    avg_recon_loss = total_recon_loss / num_batches if num_batches > 0 else 0
+    avg_kl_loss = total_kl_loss / num_batches if num_batches > 0 else 0
     
     return avg_loss, avg_recon_loss, avg_kl_loss
 
@@ -125,37 +142,46 @@ def main():
     )
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    (train_g, val_g, test_g,
-    (e2i, i2e), (r2i, i2r), *_ ) = load_data_as_list(config['dataset'])  # e.g., "syn-paths"
-
-    train_triples = [torch.tensor(g, dtype=torch.long) for g in train_g]
-    val_triples = [torch.tensor(g, dtype=torch.long) for g in val_g]
-
-    config['n_entities'] = len(e2i)
-    config['n_relations'] = len(r2i)
-
     
+    # Initialize dataset handler and check/download datasets
+    dataset_name = config['dataset']  # e.g. 'syn-paths', 'syn-tipr', etc.
+    dataset_handler = DatasetDownloader()
     
-    train_dataset = KGDataset(train_triples, config['max_edges'])
-    val_dataset = KGDataset(val_triples, config['max_edges'])
+    # Check if the datasets already exist and download if needed
+    if not dataset_handler.check_datasets_exist():
+        print("Downloading datasets...")
+        dataset_handler.download_and_verify_all()
+    else:
+        print("Verifying existing datasets...")
+        dataset_handler.verify_datasets()
     
-    train_loader = DataLoader(
-        train_dataset,
+    # Load data using IntelliGraphs DataLoader
+    data_loader = DataLoader(dataset_name=dataset_name)
+    
+    # Load PyTorch DataLoaders with padding
+    train_loader, val_loader, test_loader = data_loader.load_torch(
         batch_size=config['batch_size'],
-        shuffle=True,
-        num_workers=config.get('num_workers', 4)
+        padding=True,  # Enable padding for consistent batch sizes
+        shuffle_train=True,
+        shuffle_valid=False,
+        shuffle_test=False
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config['batch_size'],
-        shuffle=False,
-        num_workers=config.get('num_workers', 4)
-    )
+    # Get entity and relation mappings
+    entity_map = data_loader.entity_to_id
+    relation_map = data_loader.relation_to_id
     
-    # config['n_entities'] = kg.n_entities
-    # config['n_relations'] = kg.n_relations
+    # Create inverse mappings
+    i2e = {idx: entity for entity, idx in entity_map.items()}
+    i2r = {idx: relation for relation, idx in relation_map.items()}
+    
+    # Update config with dataset statistics
+    config['n_entities'] = len(entity_map)
+    config['n_relations'] = len(relation_map)
+    
+    print(f"Dataset: {dataset_name}")
+    print(f"Entities: {config['n_entities']}, Relations: {config['n_relations']}")
+    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
     
     model = KGVAE(config).to(device)
     
