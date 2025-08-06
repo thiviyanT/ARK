@@ -1,3 +1,7 @@
+# Custom
+.data
+IntelliGraphs
+
 # Python
 __pycache__/
 *.py[cod]
@@ -50,7 +54,6 @@ checkpoints/
 *.ckpt
 
 # Data
-data/
 *.csv
 *.json
 *.txt
@@ -87,6 +90,3 @@ logs/
 # Environment variables
 .env
 .env.local
-.data
-IntelliGraphs/
-.data/syn-paths.zip
