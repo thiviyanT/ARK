@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import wandb
@@ -7,7 +6,7 @@ import yaml
 import argparse
 import os
 from tqdm import tqdm
-import numpy as np
+from intelligraphs.data_loaders import load_data_as_list
 
 from kgvae.model.models import KGVAE
 from kgvae.model.utils import (
@@ -126,16 +125,6 @@ def main():
     )
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    
-    
-    # from intelligraphs import KnowledgeGraph
-    # kg = KnowledgeGraph(dataset=config['dataset'])
-    
-    # train_triples = torch.tensor(kg.train_triples, dtype=torch.long)
-    # val_triples = torch.tensor(kg.val_triples, dtype=torch.long)
-    
-    from intelligraphs.data_loaders import load_data_as_list
 
     (train_g, val_g, test_g,
     (e2i, i2e), (r2i, i2r), *_ ) = load_data_as_list(config['dataset'])  # e.g., "syn-paths"
