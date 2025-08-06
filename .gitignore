@@ -87,3 +87,6 @@ logs/
 # Environment variables
 .env
 .env.local
+.data
+IntelliGraphs/
+.data/syn-paths.zip
