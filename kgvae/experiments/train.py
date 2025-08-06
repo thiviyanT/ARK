@@ -16,6 +16,7 @@ from kgvae.model.utils import (
     compute_reconstruction_loss,
     create_padding_mask,
 )
+from kgvae.model.verification import get_verifier, sample_and_verify
 
 
 def process_batch(batch_triples, max_edges, device):
@@ -183,6 +184,11 @@ def main():
     print(f"Entities: {config['n_entities']}, Relations: {config['n_relations']}")
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
     
+    # Initialize verifier for the dataset
+    verifier = get_verifier(dataset_name)
+    if verifier is None:
+        print(f"Warning: No verifier available for dataset {dataset_name}")
+    
     model = KGVAE(config).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
@@ -211,7 +217,8 @@ def main():
             model, val_loader, config, device
         )
         
-        wandb.log({
+        # Log basic metrics
+        log_dict = {
             'epoch': epoch + 1,
             'train/loss': train_loss,
             'train/reconstruction_loss': train_recon_loss,
@@ -220,7 +227,23 @@ def main():
             'val/reconstruction_loss': val_recon_loss,
             'val/kl_loss': val_kl_loss,
             'learning_rate': optimizer.param_groups[0]['lr']
-        })
+        }
+        
+        # Periodically verify generated graphs
+        if verifier and (epoch + 1) % config.get('verify_every', 10) == 0:
+            verification_results = sample_and_verify(
+                model, config, verifier, i2e, i2r, device, 
+                num_samples=config.get('verify_samples', 100)
+            )
+            log_dict.update({
+                'verification/validity_rate': verification_results['validity_rate'],
+                'verification/valid_count': verification_results['valid_count'],
+                'verification/total_count': verification_results['total_count']
+            })
+            print(f"Graph Verification: {verification_results['valid_count']}/{verification_results['total_count']} "
+                  f"valid ({verification_results['validity_rate']:.2%})")
+        
+        wandb.log(log_dict)
         
         print(f"Train Loss: {train_loss:.4f} (Recon: {train_recon_loss:.4f}, KL: {train_kl_loss:.4f})")
         print(f"Val Loss: {val_loss:.4f} (Recon: {val_recon_loss:.4f}, KL: {val_kl_loss:.4f})")
