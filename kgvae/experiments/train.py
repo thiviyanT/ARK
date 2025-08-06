@@ -126,8 +126,8 @@ def validate(model, dataloader, config, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
-    parser.add_argument('--wandb-project', type=str, default='kgvae', help='Weights & Biases project name')
-    parser.add_argument('--wandb-entity', type=str, default=None, help='Weights & Biases entity')
+    parser.add_argument('--wandb-project', type=str, default='submission', help='Weights & Biases project name')
+    parser.add_argument('--wandb-entity', type=str, default='a-vozikis-vrije-universiteit-amsterdam', help='Weights & Biases entity')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints', help='Directory to save checkpoints')
     args = parser.parse_args()
     
