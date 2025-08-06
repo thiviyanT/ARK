@@ -87,3 +87,11 @@ logs/
 # Environment variables
 .env
 .env.local
+.data/syn-tipr.zip
+.data/syn-types.zip
+.data/wd-articles.zip
+.data/wd-articles/entity.py
+.data/wd-movies.zip
+.data/wd-movies/entity.py
+IntelliGraphs/
+.data/syn-paths.zip

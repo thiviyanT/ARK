@@ -127,11 +127,26 @@ def main():
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    from intelligraphs import KnowledgeGraph
-    kg = KnowledgeGraph(dataset=config['dataset'])
     
-    train_triples = torch.tensor(kg.train_triples, dtype=torch.long)
-    val_triples = torch.tensor(kg.val_triples, dtype=torch.long)
+    
+    # from intelligraphs import KnowledgeGraph
+    # kg = KnowledgeGraph(dataset=config['dataset'])
+    
+    # train_triples = torch.tensor(kg.train_triples, dtype=torch.long)
+    # val_triples = torch.tensor(kg.val_triples, dtype=torch.long)
+    
+    from intelligraphs.data_loaders import load_data_as_list
+
+    (train_g, val_g, test_g,
+    (e2i, i2e), (r2i, i2r), *_ ) = load_data_as_list(config['dataset'])  # e.g., "syn-paths"
+
+    train_triples = [torch.tensor(g, dtype=torch.long) for g in train_g]
+    val_triples = [torch.tensor(g, dtype=torch.long) for g in val_g]
+
+    config['n_entities'] = len(e2i)
+    config['n_relations'] = len(r2i)
+
+    
     
     train_dataset = KGDataset(train_triples, config['max_edges'])
     val_dataset = KGDataset(val_triples, config['max_edges'])
@@ -150,8 +165,8 @@ def main():
         num_workers=config.get('num_workers', 4)
     )
     
-    config['n_entities'] = kg.n_entities
-    config['n_relations'] = kg.n_relations
+    # config['n_entities'] = kg.n_entities
+    # config['n_relations'] = kg.n_relations
     
     model = KGVAE(config).to(device)
     
