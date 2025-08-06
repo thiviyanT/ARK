@@ -28,6 +28,10 @@ def verify_generated_graphs(generated_triples, verifier, i2e, i2r):
     Returns:
         Dictionary with verification statistics
     """
+    # Transfer to CPU for verification (memory efficient)
+    if generated_triples.is_cuda:
+        generated_triples = generated_triples.cpu()
+    
     batch_size = generated_triples.size(0)
     valid_count = 0
     invalid_reasons = []
@@ -103,7 +107,11 @@ def sample_and_verify(model, config, verifier, i2e, i2r, device, num_samples=100
         # Generate graphs using the model's sample method
         generated_triples = model.sample(num_samples, device)
         
-        # Verify the generated graphs
+        # Transfer to CPU for verification
+        if generated_triples.is_cuda:
+            generated_triples = generated_triples.cpu()
+        
+        # Verify the generated graphs on CPU
         verification_results = verify_generated_graphs(
             generated_triples, verifier, i2e, i2r
         )

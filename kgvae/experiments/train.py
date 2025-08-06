@@ -191,6 +191,11 @@ def main():
     
     model = KGVAE(config).to(device)
     
+    # Support multi-GPU training if available
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs for training")
+        model = torch.nn.DataParallel(model)
+    
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     
     if config.get('lr_scheduler', False):
@@ -253,9 +258,11 @@ def main():
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            # Handle DataParallel when saving
+            model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
             checkpoint = {
                 'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': model_state,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
                 'config': config
@@ -267,9 +274,11 @@ def main():
             print(f"Saved best model with validation loss: {val_loss:.4f}")
         
         if (epoch + 1) % config.get('save_every', 10) == 0:
+            # Handle DataParallel when saving
+            model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
             checkpoint = {
                 'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': model_state,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
                 'config': config
