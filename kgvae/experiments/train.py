@@ -1,37 +1,47 @@
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
 import wandb
 import yaml
 import argparse
 import os
 from tqdm import tqdm
-from intelligraphs.data_loaders import load_data_as_list
+import numpy as np
+
+from intelligraphs import DataLoader
+from intelligraphs.data_loaders import DatasetDownloader
 
 from kgvae.model.models import KGVAE
 from kgvae.model.utils import (
     compute_kl_divergence,
     compute_reconstruction_loss,
-    pad_triples,
     create_padding_mask,
-    compute_entity_sorting_loss
 )
+from kgvae.model.verification import get_verifier, sample_and_verify
 
 
-class KGDataset(Dataset):
-    def __init__(self, triples, max_edges):
-        self.triples = triples
-        self.max_edges = max_edges
-        
-    def __len__(self):
-        return len(self.triples)
-        
-    def __getitem__(self, idx):
-        triple_set = self.triples[idx]
-        padded_triples = pad_triples(triple_set.unsqueeze(0), self.max_edges).squeeze(0)
-        mask = create_padding_mask(padded_triples.unsqueeze(0)).squeeze(0)
-        
-        return padded_triples, mask
+def process_batch(batch_triples, max_edges, device):
+    """
+    Process a batch of triples from IntelliGraphs DataLoader.
+    """
+    # batch_triples is already a tensor from IntelliGraphs
+    batch_size = batch_triples.size(0)
+    
+    # Pad/truncate to max_edges
+    current_edges = batch_triples.size(1)
+    
+    if current_edges > max_edges:
+        # Truncate
+        batch_triples = batch_triples[:, :max_edges, :]
+    elif current_edges < max_edges:
+        # Pad with zeros
+        padding = torch.zeros(batch_size, max_edges - current_edges, 3, 
+                             dtype=batch_triples.dtype, device=batch_triples.device)
+        batch_triples = torch.cat([batch_triples, padding], dim=1)
+    
+    # Create mask for padding
+    mask = create_padding_mask(batch_triples)
+    
+    return batch_triples, mask
 
 
 def train_epoch(model, dataloader, optimizer, config, device):
@@ -39,8 +49,11 @@ def train_epoch(model, dataloader, optimizer, config, device):
     total_loss = 0
     total_recon_loss = 0
     total_kl_loss = 0
+    num_batches = 0
     
-    for batch_idx, (triples, mask) in enumerate(tqdm(dataloader, desc="Training")):
+    for batch_idx, batch_triples in enumerate(tqdm(dataloader, desc="Training")):
+        # Process batch from IntelliGraphs DataLoader
+        triples, mask = process_batch(batch_triples, config['max_edges'], device)
         triples = triples.to(device)
         mask = mask.to(device)
         
@@ -64,10 +77,11 @@ def train_epoch(model, dataloader, optimizer, config, device):
         total_loss += loss.item()
         total_recon_loss += recon_loss.item()
         total_kl_loss += kl_loss.item()
+        num_batches += 1
         
-    avg_loss = total_loss / len(dataloader)
-    avg_recon_loss = total_recon_loss / len(dataloader)
-    avg_kl_loss = total_kl_loss / len(dataloader)
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0
+    avg_recon_loss = total_recon_loss / num_batches if num_batches > 0 else 0
+    avg_kl_loss = total_kl_loss / num_batches if num_batches > 0 else 0
     
     return avg_loss, avg_recon_loss, avg_kl_loss
 
@@ -77,9 +91,12 @@ def validate(model, dataloader, config, device):
     total_loss = 0
     total_recon_loss = 0
     total_kl_loss = 0
+    num_batches = 0
     
     with torch.no_grad():
-        for triples, mask in tqdm(dataloader, desc="Validation"):
+        for batch_triples in tqdm(dataloader, desc="Validation"):
+            # Process batch from IntelliGraphs DataLoader
+            triples, mask = process_batch(batch_triples, config['max_edges'], device)
             triples = triples.to(device)
             mask = mask.to(device)
             
@@ -98,10 +115,11 @@ def validate(model, dataloader, config, device):
             total_loss += loss.item()
             total_recon_loss += recon_loss.item()
             total_kl_loss += kl_loss.item()
+            num_batches += 1
             
-    avg_loss = total_loss / len(dataloader)
-    avg_recon_loss = total_recon_loss / len(dataloader)
-    avg_kl_loss = total_kl_loss / len(dataloader)
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0
+    avg_recon_loss = total_recon_loss / num_batches if num_batches > 0 else 0
+    avg_kl_loss = total_kl_loss / num_batches if num_batches > 0 else 0
     
     return avg_loss, avg_recon_loss, avg_kl_loss
 
@@ -109,8 +127,8 @@ def validate(model, dataloader, config, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
-    parser.add_argument('--wandb-project', type=str, default='kgvae', help='Weights & Biases project name')
-    parser.add_argument('--wandb-entity', type=str, default=None, help='Weights & Biases entity')
+    parser.add_argument('--wandb-project', type=str, default='submission', help='Weights & Biases project name')
+    parser.add_argument('--wandb-entity', type=str, default='a-vozikis-vrije-universiteit-amsterdam', help='Weights & Biases entity')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints', help='Directory to save checkpoints')
     args = parser.parse_args()
     
@@ -125,39 +143,58 @@ def main():
     )
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    (train_g, val_g, test_g,
-    (e2i, i2e), (r2i, i2r), *_ ) = load_data_as_list(config['dataset'])  # e.g., "syn-paths"
-
-    train_triples = [torch.tensor(g, dtype=torch.long) for g in train_g]
-    val_triples = [torch.tensor(g, dtype=torch.long) for g in val_g]
-
-    config['n_entities'] = len(e2i)
-    config['n_relations'] = len(r2i)
-
     
+    # Initialize dataset handler and check/download datasets
+    dataset_name = config['dataset']  # e.g. 'syn-paths', 'syn-tipr', etc.
+    dataset_handler = DatasetDownloader()
     
-    train_dataset = KGDataset(train_triples, config['max_edges'])
-    val_dataset = KGDataset(val_triples, config['max_edges'])
+    # Check if the datasets already exist and download if needed
+    if not dataset_handler.check_datasets_exist():
+        print("Downloading datasets...")
+        dataset_handler.download_and_verify_all()
+    else:
+        print("Verifying existing datasets...")
+        dataset_handler.verify_datasets()
     
-    train_loader = DataLoader(
-        train_dataset,
+    # Load data using IntelliGraphs DataLoader
+    data_loader = DataLoader(dataset_name=dataset_name)
+    
+    # Load PyTorch DataLoaders with padding
+    train_loader, val_loader, test_loader = data_loader.load_torch(
         batch_size=config['batch_size'],
-        shuffle=True,
-        num_workers=config.get('num_workers', 4)
+        padding=True,  # Enable padding for consistent batch sizes
+        shuffle_train=True,
+        shuffle_valid=False,
+        shuffle_test=False
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config['batch_size'],
-        shuffle=False,
-        num_workers=config.get('num_workers', 4)
-    )
+    # Get entity and relation mappings
+    entity_map = data_loader.entity_to_id
+    relation_map = data_loader.relation_to_id
     
-    # config['n_entities'] = kg.n_entities
-    # config['n_relations'] = kg.n_relations
+    # Create inverse mappings
+    i2e = {idx: entity for entity, idx in entity_map.items()}
+    i2r = {idx: relation for relation, idx in relation_map.items()}
+    
+    # Update config with dataset statistics
+    config['n_entities'] = len(entity_map)
+    config['n_relations'] = len(relation_map)
+    
+    print(f"Dataset: {dataset_name}")
+    print(f"Entities: {config['n_entities']}, Relations: {config['n_relations']}")
+    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+    
+    # Initialize verifier for the dataset
+    verifier = get_verifier(dataset_name)
+    if verifier is None:
+        print(f"Warning: No verifier available for dataset {dataset_name}")
     
     model = KGVAE(config).to(device)
+    
+    # Support multi-GPU training if available
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs for training")
+        model = torch.nn.DataParallel(model)
     
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     
@@ -185,7 +222,8 @@ def main():
             model, val_loader, config, device
         )
         
-        wandb.log({
+        # Log basic metrics
+        log_dict = {
             'epoch': epoch + 1,
             'train/loss': train_loss,
             'train/reconstruction_loss': train_recon_loss,
@@ -194,7 +232,23 @@ def main():
             'val/reconstruction_loss': val_recon_loss,
             'val/kl_loss': val_kl_loss,
             'learning_rate': optimizer.param_groups[0]['lr']
-        })
+        }
+        
+        # Periodically verify generated graphs
+        if verifier and (epoch + 1) % config.get('verify_every', 10) == 0:
+            verification_results = sample_and_verify(
+                model, config, verifier, i2e, i2r, device, 
+                num_samples=config.get('verify_samples', 100)
+            )
+            log_dict.update({
+                'verification/validity_rate': verification_results['validity_rate'],
+                'verification/valid_count': verification_results['valid_count'],
+                'verification/total_count': verification_results['total_count']
+            })
+            print(f"Graph Verification: {verification_results['valid_count']}/{verification_results['total_count']} "
+                  f"valid ({verification_results['validity_rate']:.2%})")
+        
+        wandb.log(log_dict)
         
         print(f"Train Loss: {train_loss:.4f} (Recon: {train_recon_loss:.4f}, KL: {train_kl_loss:.4f})")
         print(f"Val Loss: {val_loss:.4f} (Recon: {val_recon_loss:.4f}, KL: {val_kl_loss:.4f})")
@@ -204,9 +258,11 @@ def main():
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            # Handle DataParallel when saving
+            model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
             checkpoint = {
                 'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': model_state,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
                 'config': config
@@ -218,9 +274,11 @@ def main():
             print(f"Saved best model with validation loss: {val_loss:.4f}")
         
         if (epoch + 1) % config.get('save_every', 10) == 0:
+            # Handle DataParallel when saving
+            model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
             checkpoint = {
                 'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': model_state,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
                 'config': config

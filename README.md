@@ -32,6 +32,11 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 uv pip install -e .
 ```
 
+3. Download IntelliGraphs datasets:
+```bash
+python -m intelligraphs.data_loaders.download
+```
+
 ## Project Structure
 
 ```
