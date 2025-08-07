@@ -11,6 +11,7 @@ from intelligraphs import DataLoader
 from intelligraphs.data_loaders import DatasetDownloader
 
 from kgvae.model.models import KGVAE
+from kgvae.model.rescal_vae_model import RESCALVAE
 from kgvae.model.utils import (
     compute_kl_divergence,
     compute_reconstruction_loss,
@@ -19,7 +20,7 @@ from kgvae.model.utils import (
 from kgvae.model.verification import get_verifier, sample_and_verify
 
 
-def process_batch(batch_triples, max_edges, device):
+def process_batch(batch_triples, max_edges, max_nodes, device):
     """
     Process a batch of triples from IntelliGraphs DataLoader.
     """
@@ -41,7 +42,17 @@ def process_batch(batch_triples, max_edges, device):
     # Create mask for padding
     mask = create_padding_mask(batch_triples)
     
-    return batch_triples, mask
+    # Extract unique nodes from triples for RESCALVAE
+    nodes = torch.zeros(batch_size, max_nodes, dtype=torch.long, device=device)
+    for b in range(batch_size):
+        unique_nodes = torch.unique(batch_triples[b, :, [0, 2]].flatten())
+        # Filter out padding (0) and place in nodes tensor
+        unique_nodes = unique_nodes[unique_nodes != 0]
+        num_nodes = min(len(unique_nodes), max_nodes)
+        if num_nodes > 0:
+            nodes[b, :num_nodes] = unique_nodes[:num_nodes]
+    
+    return batch_triples, nodes, mask
 
 
 def train_epoch(model, dataloader, optimizer, config, device):
@@ -49,27 +60,38 @@ def train_epoch(model, dataloader, optimizer, config, device):
     total_loss = 0
     total_recon_loss = 0
     total_kl_loss = 0
+    total_entity_loss = 0
     num_batches = 0
+    
+    model_type = config.get('model_type', 'kgvae')
     
     for batch_idx, batch_triples in enumerate(tqdm(dataloader, desc="Training")):
         # Process batch from IntelliGraphs DataLoader
-        triples, mask = process_batch(batch_triples, config['max_edges'], device)
+        triples, nodes, mask = process_batch(batch_triples, config['max_edges'], config['max_nodes'], device)
         triples = triples.to(device)
         mask = mask.to(device)
         
         optimizer.zero_grad()
         
-        outputs = model(triples, mask)
-        
-        recon_loss = compute_reconstruction_loss(
-            (outputs['subject_logits'], outputs['relation_logits'], outputs['object_logits']),
-            triples,
-            mask
-        )
-        
-        kl_loss = compute_kl_divergence(outputs['mu'], outputs['logvar'])
-        
-        loss = recon_loss + config['beta'] * kl_loss
+        if model_type == 'rescal_vae':
+            # RESCALVAE forward pass and loss computation
+            outputs = model(triples, nodes, mask)
+            loss_dict = model.compute_loss(outputs, triples, nodes, mask)
+            loss = loss_dict['loss']
+            recon_loss = loss_dict['edge_loss']
+            kl_loss = loss_dict['kl_loss']
+            entity_loss = loss_dict.get('entity_loss', 0)
+            total_entity_loss += entity_loss.item() if torch.is_tensor(entity_loss) else entity_loss
+        else:
+            # Original KGVAE forward pass
+            outputs = model(triples, mask)
+            recon_loss = compute_reconstruction_loss(
+                (outputs['subject_logits'], outputs['relation_logits'], outputs['object_logits']),
+                triples,
+                mask
+            )
+            kl_loss = compute_kl_divergence(outputs['mu'], outputs['logvar'])
+            loss = recon_loss + config['beta'] * kl_loss
         
         loss.backward()
         optimizer.step()
@@ -82,7 +104,10 @@ def train_epoch(model, dataloader, optimizer, config, device):
     avg_loss = total_loss / num_batches if num_batches > 0 else 0
     avg_recon_loss = total_recon_loss / num_batches if num_batches > 0 else 0
     avg_kl_loss = total_kl_loss / num_batches if num_batches > 0 else 0
+    avg_entity_loss = total_entity_loss / num_batches if num_batches > 0 else 0
     
+    if model_type == 'rescal_vae':
+        return avg_loss, avg_recon_loss, avg_kl_loss, avg_entity_loss
     return avg_loss, avg_recon_loss, avg_kl_loss
 
 
@@ -91,26 +116,37 @@ def validate(model, dataloader, config, device):
     total_loss = 0
     total_recon_loss = 0
     total_kl_loss = 0
+    total_entity_loss = 0
     num_batches = 0
+    
+    model_type = config.get('model_type', 'kgvae')
     
     with torch.no_grad():
         for batch_triples in tqdm(dataloader, desc="Validation"):
             # Process batch from IntelliGraphs DataLoader
-            triples, mask = process_batch(batch_triples, config['max_edges'], device)
+            triples, nodes, mask = process_batch(batch_triples, config['max_edges'], config['max_nodes'], device)
             triples = triples.to(device)
             mask = mask.to(device)
             
-            outputs = model(triples, mask)
-            
-            recon_loss = compute_reconstruction_loss(
-                (outputs['subject_logits'], outputs['relation_logits'], outputs['object_logits']),
-                triples,
-                mask
-            )
-            
-            kl_loss = compute_kl_divergence(outputs['mu'], outputs['logvar'])
-            
-            loss = recon_loss + config['beta'] * kl_loss
+            if model_type == 'rescal_vae':
+                # RESCALVAE forward pass and loss computation
+                outputs = model(triples, nodes, mask)
+                loss_dict = model.compute_loss(outputs, triples, nodes, mask)
+                loss = loss_dict['loss']
+                recon_loss = loss_dict['edge_loss']
+                kl_loss = loss_dict['kl_loss']
+                entity_loss = loss_dict.get('entity_loss', 0)
+                total_entity_loss += entity_loss.item() if torch.is_tensor(entity_loss) else entity_loss
+            else:
+                # Original KGVAE forward pass
+                outputs = model(triples, mask)
+                recon_loss = compute_reconstruction_loss(
+                    (outputs['subject_logits'], outputs['relation_logits'], outputs['object_logits']),
+                    triples,
+                    mask
+                )
+                kl_loss = compute_kl_divergence(outputs['mu'], outputs['logvar'])
+                loss = recon_loss + config['beta'] * kl_loss
             
             total_loss += loss.item()
             total_recon_loss += recon_loss.item()
@@ -120,7 +156,10 @@ def validate(model, dataloader, config, device):
     avg_loss = total_loss / num_batches if num_batches > 0 else 0
     avg_recon_loss = total_recon_loss / num_batches if num_batches > 0 else 0
     avg_kl_loss = total_kl_loss / num_batches if num_batches > 0 else 0
+    avg_entity_loss = total_entity_loss / num_batches if num_batches > 0 else 0
     
+    if model_type == 'rescal_vae':
+        return avg_loss, avg_recon_loss, avg_kl_loss, avg_entity_loss
     return avg_loss, avg_recon_loss, avg_kl_loss
 
 
@@ -189,7 +228,13 @@ def main():
     if verifier is None:
         print(f"Warning: No verifier available for dataset {dataset_name}")
     
-    model = KGVAE(config).to(device)
+    # Initialize model based on config
+    model_type = config.get('model_type', 'kgvae')
+    if model_type == 'rescal_vae':
+        model = RESCALVAE(config).to(device)
+    else:
+        model = KGVAE(config).to(device)
+    print(f"Using model: {model_type}")
     
     # Support multi-GPU training if available
     if torch.cuda.device_count() > 1:
@@ -203,8 +248,7 @@ def main():
             optimizer,
             mode='min',
             factor=0.5,
-            patience=5,
-            verbose=True
+            patience=5
         )
     
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -214,13 +258,18 @@ def main():
     for epoch in range(config['num_epochs']):
         print(f"\nEpoch {epoch + 1}/{config['num_epochs']}")
         
-        train_loss, train_recon_loss, train_kl_loss = train_epoch(
-            model, train_loader, optimizer, config, device
-        )
+        train_results = train_epoch(model, train_loader, optimizer, config, device)
+        val_results = validate(model, val_loader, config, device)
         
-        val_loss, val_recon_loss, val_kl_loss = validate(
-            model, val_loader, config, device
-        )
+        # Handle different return values based on model type
+        if config.get('model_type', 'kgvae') == 'rescal_vae':
+            train_loss, train_recon_loss, train_kl_loss, train_entity_loss = train_results
+            val_loss, val_recon_loss, val_kl_loss, val_entity_loss = val_results
+        else:
+            train_loss, train_recon_loss, train_kl_loss = train_results
+            val_loss, val_recon_loss, val_kl_loss = val_results
+            train_entity_loss = 0
+            val_entity_loss = 0
         
         # Log basic metrics
         log_dict = {
@@ -233,6 +282,11 @@ def main():
             'val/kl_loss': val_kl_loss,
             'learning_rate': optimizer.param_groups[0]['lr']
         }
+        
+        # Add entity loss for RESCALVAE
+        if config.get('model_type', 'kgvae') == 'rescal_vae':
+            log_dict['train/entity_loss'] = train_entity_loss
+            log_dict['val/entity_loss'] = val_entity_loss
         
         # Periodically verify generated graphs
         if verifier and (epoch + 1) % config.get('verify_every', 10) == 0:
