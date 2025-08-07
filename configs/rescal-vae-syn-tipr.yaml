@@ -14,9 +14,9 @@ dropout: 0.1
 batch_size: 1024
 learning_rate: 0.0005
 num_epochs: 1300
-beta: 0.0000001  # KL divergence weight
-gamma: 100.0     # Entity loss weight
-zeta: 1.0        # Edge reconstruction loss weight
+beta: 0.001      # KL divergence weight
+gamma: 1.0       # Entity loss weight
+zeta: 10.0       # Edge reconstruction loss weight
 
 # Dataset parameters
 dataset: syn-tipr

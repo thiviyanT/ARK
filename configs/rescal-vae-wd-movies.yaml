@@ -13,9 +13,9 @@ dropout: 0.1
 batch_size: 512
 learning_rate: 0.0002
 num_epochs: 800
-beta: 0.000001
-gamma: 10.0
-zeta: 1.0
+beta: 0.001      # KL divergence weight
+gamma: 1.0       # Entity loss weight
+zeta: 10.0       # Edge reconstruction loss weight
 
 dataset: wd-movies
 max_nodes: 100
