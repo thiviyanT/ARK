@@ -4,6 +4,7 @@ import wandb
 import yaml
 import argparse
 import os
+import warnings
 from tqdm import tqdm
 import numpy as np
 
@@ -183,6 +184,14 @@ def main():
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
+    # Warning for test set evaluation
+    if config.get('use_test_for_final_eval', False):
+        warnings.warn(
+            "Test set evaluation ENABLED! Only use for final evaluation, NOT for hyperparameter tuning!",
+            UserWarning,
+            stacklevel=2
+        )
+    
     # Initialize dataset handler and check/download datasets
     dataset_name = config['dataset']  # e.g. 'syn-paths', 'syn-tipr', etc.
     dataset_handler = DatasetDownloader()
@@ -342,8 +351,58 @@ def main():
                 os.path.join(args.checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pt')
             )
     
+    # Final evaluation
+    use_test = config.get('use_test_for_final_eval', False)
+    eval_set_name = "test" if use_test else "validation"
+    eval_loader = test_loader if use_test else val_loader
+    
+    print(f"\n{'='*50}\nFinal evaluation on {eval_set_name} set...")
+    if use_test:
+        warnings.warn("Using TEST SET for final evaluation", UserWarning)
+    
+    # Run final evaluation using existing validate function
+    final_results = validate(model, eval_loader, config, device)
+    
+    # Unpack results based on model type
+    if config.get('model_type', 'kgvae') == 'rescal_vae':
+        final_loss, final_recon_loss, final_kl_loss, final_entity_loss = final_results
+        log_dict = {
+            f'final_{eval_set_name}/loss': final_loss,
+            f'final_{eval_set_name}/reconstruction_loss': final_recon_loss,
+            f'final_{eval_set_name}/kl_loss': final_kl_loss,
+            f'final_{eval_set_name}/entity_loss': final_entity_loss
+        }
+        print(f"\nFinal {eval_set_name}: Loss={final_loss:.4f}, Recon={final_recon_loss:.4f}, "
+              f"KL={final_kl_loss:.4f}, Entity={final_entity_loss:.4f}")
+    else:
+        final_loss, final_recon_loss, final_kl_loss = final_results
+        log_dict = {
+            f'final_{eval_set_name}/loss': final_loss,
+            f'final_{eval_set_name}/reconstruction_loss': final_recon_loss,
+            f'final_{eval_set_name}/kl_loss': final_kl_loss
+        }
+        print(f"\nFinal {eval_set_name}: Loss={final_loss:.4f}, Recon={final_recon_loss:.4f}, KL={final_kl_loss:.4f}")
+    
+    # Final verification
+    if verifier:
+        final_verification = sample_and_verify(
+            model, config, verifier, i2e, i2r, device,
+            num_samples=config.get('verify_samples', 100)
+        )
+        print(f"Final generation validity: {final_verification['validity_rate']:.2%} "
+              f"({final_verification['valid_count']}/{final_verification['total_count']})")
+        
+        log_dict.update({
+            f'final_{eval_set_name}/validity_rate': final_verification['validity_rate'],
+            f'final_{eval_set_name}/valid_count': final_verification['valid_count'],
+            f'final_{eval_set_name}/total_count': final_verification['total_count']
+        })
+    
+    wandb.log(log_dict)
+    print("="*50)
+    
     wandb.finish()
-    print("Training completed!")
+    print("\nTraining and evaluation completed!")
 
 
 if __name__ == "__main__":
