@@ -7,18 +7,31 @@ import os
 import warnings
 from tqdm import tqdm
 import numpy as np
+import torch.nn.functional as F
+
 
 from intelligraphs import DataLoader
 from intelligraphs.data_loaders import DatasetDownloader
+from intelligraphs.data_loaders import load_data_as_list
+
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader as PDataLoader
+
 
 from kgvae.model.models import KGVAE
 from kgvae.model.rescal_vae_model import RESCALVAE
+from kgvae.model.models import AutoRegModel
 from kgvae.model.utils import (
     compute_kl_divergence,
     compute_reconstruction_loss,
     create_padding_mask,
+    GraphSeqDataset,
+    kl_mean,
 )
 from kgvae.model.verification import get_verifier, sample_and_verify
+from kgvae.model.utils import posterior_bits, decode_latent, ints_to_labels, generate_test_graphs, seq_to_triples, count_unique_graphs
+from kgvae.model.verification import run_semantic_evaluation
+
 
 
 def process_batch(batch_triples, max_edges, max_nodes, device):
@@ -56,7 +69,7 @@ def process_batch(batch_triples, max_edges, max_nodes, device):
     return batch_triples, nodes, mask
 
 
-def train_epoch(model, dataloader, optimizer, config, device):
+def train_epoch(model, dataloader, optimizer, config, device, b=1.0): 
     model.train()
     total_loss = 0
     total_recon_loss = 0
@@ -67,63 +80,24 @@ def train_epoch(model, dataloader, optimizer, config, device):
     model_type = config.get('model_type', 'kgvae')
     
     for batch_idx, batch_triples in enumerate(tqdm(dataloader, desc="Training")):
-        # Process batch from IntelliGraphs DataLoader
-        triples, nodes, mask = process_batch(batch_triples, config['max_edges'], config['max_nodes'], device)
-        triples = triples.to(device)
-        mask = mask.to(device)
-        
         optimizer.zero_grad()
-        
-        if model_type == 'rescal_vae':
-            # RESCALVAE forward pass and loss computation
-            outputs = model(triples, nodes, mask)
-            loss_dict = model.compute_loss(outputs, triples, nodes, mask)
-            loss = loss_dict['loss']
-            recon_loss = loss_dict['edge_loss']
-            kl_loss = loss_dict['kl_loss']
-            entity_loss = loss_dict.get('entity_loss', 0)
-            total_entity_loss += entity_loss.item() if torch.is_tensor(entity_loss) else entity_loss
-        else:
-            # Original KGVAE forward pass
-            outputs = model(triples, mask)
-            recon_loss = compute_reconstruction_loss(
-                (outputs['subject_logits'], outputs['relation_logits'], outputs['object_logits']),
-                triples,
-                mask
+        #autoregressive loss for train
+        if model_type == 'autoreg':
+            triples, seq = batch_triples
+            triples = triples.to(device)
+            seq = seq.to(device)
+            logits, mu, logv = model(triples, seq[:, :-1])
+            vocab = logits.size(-1)
+            ce = F.cross_entropy(
+                logits.reshape(-1, vocab),
+                seq[:, 1:].reshape(-1),
+                ignore_index=config["SPECIAL"]["PAD"]
             )
-            kl_loss = compute_kl_divergence(outputs['mu'], outputs['logvar'])
-            loss = recon_loss + config['beta'] * kl_loss
-        
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-        total_recon_loss += recon_loss.item()
-        total_kl_loss += kl_loss.item()
-        num_batches += 1
-        
-    avg_loss = total_loss / num_batches if num_batches > 0 else 0
-    avg_recon_loss = total_recon_loss / num_batches if num_batches > 0 else 0
-    avg_kl_loss = total_kl_loss / num_batches if num_batches > 0 else 0
-    avg_entity_loss = total_entity_loss / num_batches if num_batches > 0 else 0
-    
-    if model_type == 'rescal_vae':
-        return avg_loss, avg_recon_loss, avg_kl_loss, avg_entity_loss
-    return avg_loss, avg_recon_loss, avg_kl_loss
-
-
-def validate(model, dataloader, config, device):
-    model.eval()
-    total_loss = 0
-    total_recon_loss = 0
-    total_kl_loss = 0
-    total_entity_loss = 0
-    num_batches = 0
-    
-    model_type = config.get('model_type', 'kgvae')
-    
-    with torch.no_grad():
-        for batch_triples in tqdm(dataloader, desc="Validation"):
+            kl = kl_mean(mu, logv)
+            loss = ce + b * kl
+            recon_loss = ce
+            kl_loss = kl
+        else:
             # Process batch from IntelliGraphs DataLoader
             triples, nodes, mask = process_batch(batch_triples, config['max_edges'], config['max_nodes'], device)
             triples = triples.to(device)
@@ -148,6 +122,78 @@ def validate(model, dataloader, config, device):
                 )
                 kl_loss = compute_kl_divergence(outputs['mu'], outputs['logvar'])
                 loss = recon_loss + config['beta'] * kl_loss
+        
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+        total_recon_loss += recon_loss.item()
+        total_kl_loss += kl_loss.item()
+        num_batches += 1
+        
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0
+    avg_recon_loss = total_recon_loss / num_batches if num_batches > 0 else 0
+    avg_kl_loss = total_kl_loss / num_batches if num_batches > 0 else 0
+    avg_entity_loss = total_entity_loss / num_batches if num_batches > 0 else 0
+    
+    if model_type == 'rescal_vae':
+        return avg_loss, avg_recon_loss, avg_kl_loss, avg_entity_loss
+    return avg_loss, avg_recon_loss, avg_kl_loss
+
+
+def validate(model, dataloader, config, device, b=1.0):
+    model.eval()
+    total_loss = 0
+    total_recon_loss = 0
+    total_kl_loss = 0
+    total_entity_loss = 0
+    num_batches = 0
+    
+    model_type = config.get('model_type', 'kgvae')
+    
+    with torch.no_grad():
+        for batch_triples in tqdm(dataloader, desc="Validation"):
+            #autoregressive loss for validation
+            if model_type == 'autoreg':
+                triples, seq = batch_triples
+                triples = triples.to(device)
+                seq = seq.to(device)
+                logits, mu, logv = model(triples, seq[:, :-1])
+                vocab = logits.size(-1)
+                ce = F.cross_entropy(
+                    logits.reshape(-1, vocab),
+                    seq[:, 1:].reshape(-1),
+                    ignore_index=config["SPECIAL"]["PAD"]
+                )
+                kl = kl_mean(mu, logv)
+                loss = ce + b * kl
+                recon_loss = ce
+                kl_loss = kl
+            else:
+            # Process batch from IntelliGraphs DataLoader
+                triples, nodes, mask = process_batch(batch_triples, config['max_edges'], config['max_nodes'], device)
+                triples = triples.to(device)
+                mask = mask.to(device)
+                
+                if model_type == 'rescal_vae':
+                    # RESCALVAE forward pass and loss computation
+                    outputs = model(triples, nodes, mask)
+                    loss_dict = model.compute_loss(outputs, triples, nodes, mask)
+                    loss = loss_dict['loss']
+                    recon_loss = loss_dict['edge_loss']
+                    kl_loss = loss_dict['kl_loss']
+                    entity_loss = loss_dict.get('entity_loss', 0)
+                    total_entity_loss += entity_loss.item() if torch.is_tensor(entity_loss) else entity_loss
+                else:
+                    # Original KGVAE forward pass
+                    outputs = model(triples, mask)
+                    recon_loss = compute_reconstruction_loss(
+                        (outputs['subject_logits'], outputs['relation_logits'], outputs['object_logits']),
+                        triples,
+                        mask
+                    )
+                    kl_loss = compute_kl_divergence(outputs['mu'], outputs['logvar'])
+                    loss = recon_loss + config['beta'] * kl_loss
             
             total_loss += loss.item()
             total_recon_loss += recon_loss.item()
@@ -174,6 +220,8 @@ def main():
     
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
+        
+    model_type = config.get('model_type', 'kgvae')
     
     wandb.init(
         project=args.wandb_project,
@@ -224,6 +272,94 @@ def main():
     i2e = {idx: entity for entity, idx in entity_map.items()}
     i2r = {idx: relation for relation, idx in relation_map.items()}
     
+    #autoreg model specific configurations
+    (train_g, val_g, test_g,(e2i, _),(r2i, _),(min_edges, max_edges), _) = load_data_as_list(dataset_name)
+    if model_type == 'autoreg':
+        (train_g, val_g, test_g,(e2i, i2e),(r2i, i2r),(min_edges, max_edges), _) = load_data_as_list(dataset_name)
+    
+    RAW_NUM_ENTITIES  = len(e2i)
+    RAW_NUM_RELATIONS = len(r2i)
+    num_entities  = RAW_NUM_ENTITIES
+    num_relations = RAW_NUM_RELATIONS
+    max_triples = max_edges
+    use_padding  = config.get("use_padding", dataset_name.startswith("wd-"))
+
+    if use_padding:
+        PAD_EID = RAW_NUM_ENTITIES
+        PAD_RID = RAW_NUM_RELATIONS
+        num_entities  += 1
+        num_relations += 1
+    else:
+        PAD_EID = None
+        PAD_RID = None
+
+    SPECIAL    = {"PAD": 0, "BOS": 1, "EOS": 2}
+    ENT_BASE   = 3
+    REL_BASE   = ENT_BASE + RAW_NUM_ENTITIES  
+    VOCAB_SIZE = REL_BASE + RAW_NUM_RELATIONS
+    seq_len    = 1 + max_triples * 3 + 1
+    
+    #custom dataset class because of different ordering/shuffling etc 
+    if model_type == 'autoreg':    
+        train_loader = PDataLoader(
+        GraphSeqDataset(
+            graphs=train_g,
+            i2e=i2e,
+            i2r=i2r,
+            triple_order="alpha_name",
+            permute=False,
+            use_padding=use_padding,
+            pad_eid=PAD_EID,
+            pad_rid=PAD_RID,
+            max_triples=max_triples,
+            special=SPECIAL,
+            ent_base=ENT_BASE,
+            rel_base=REL_BASE,
+            seq_len=seq_len,
+        ),
+        batch_size=config['batch_size'],
+        shuffle=config['shuffle_train'],
+        drop_last=True,
+    )
+
+        val_loader = PDataLoader(
+            GraphSeqDataset(
+                graphs=val_g,
+                i2e=i2e,
+                i2r=i2r,
+                triple_order="alpha_name",
+                permute=False,
+                use_padding=use_padding,
+                pad_eid=PAD_EID,
+                pad_rid=PAD_RID,
+                max_triples=max_triples,
+                special=SPECIAL,
+                ent_base=ENT_BASE,
+                rel_base=REL_BASE,
+                seq_len=seq_len,
+            ),
+            batch_size=config['batch_size']
+        )
+
+        test_loader = PDataLoader(
+            GraphSeqDataset(
+                graphs=test_g,
+                i2e=i2e,
+                i2r=i2r,
+                triple_order="alpha_name",
+                permute=False,
+                use_padding=use_padding,
+                pad_eid=PAD_EID,
+                pad_rid=PAD_RID,
+                max_triples=max_triples,
+                special=SPECIAL,
+                ent_base=ENT_BASE,
+                rel_base=REL_BASE,
+                seq_len=seq_len,
+            ),
+            batch_size=config['batch_size']
+        )
+    
     # Update config with dataset statistics
     config['n_entities'] = len(entity_map)
     config['n_relations'] = len(relation_map)
@@ -241,6 +377,20 @@ def main():
     model_type = config.get('model_type', 'kgvae')
     if model_type == 'rescal_vae':
         model = RESCALVAE(config).to(device)
+    
+    #autoregressive modeland get the configs to work
+    elif model_type == 'autoreg':
+        config.update({
+    "n_entities": num_entities,
+    "n_relations": num_relations,
+    "pad_eid": PAD_EID,
+    "pad_rid": PAD_RID,
+    "seq_len": seq_len,
+    "vocab_size": VOCAB_SIZE,
+    "SPECIAL": SPECIAL,
+    "ENT_BASE": ENT_BASE,
+    "REL_BASE": REL_BASE})
+        model = AutoRegModel(config).to(device)
     else:
         model = KGVAE(config).to(device)
     print(f"Using model: {model_type}")
@@ -252,13 +402,24 @@ def main():
     
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     
+    scheduler = None
     if config.get('lr_scheduler', False):
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=0.5,
-            patience=5
-        )
+        #the scheduler that works better because of beta annealing
+        #if the model is autoregressive, we use CosineAnnealingLR
+        if model_type == 'autoreg':
+        # match the second script
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=config['num_epochs'],
+                eta_min=config.get('eta_min', 1e-6)
+            )
+        else:
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=0.5,
+                patience=5
+            )
     
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     
@@ -266,9 +427,10 @@ def main():
     
     for epoch in range(config['num_epochs']):
         print(f"\nEpoch {epoch + 1}/{config['num_epochs']}")
-        
-        train_results = train_epoch(model, train_loader, optimizer, config, device)
-        val_results = validate(model, val_loader, config, device)
+        b = config['beta0'] + (config['beta1'] - config['beta0']) * epoch / config['num_epochs']
+
+        train_results = train_epoch(model, train_loader, optimizer, config, device,b)
+        val_results = validate(model, val_loader, config, device,b)
         
         # Handle different return values based on model type
         if config.get('model_type', 'kgvae') == 'rescal_vae':
@@ -299,26 +461,67 @@ def main():
         
         # Periodically verify generated graphs
         if verifier and (epoch + 1) % config.get('verify_every', 10) == 0:
-            verification_results = sample_and_verify(
-                model, config, verifier, i2e, i2r, device, 
-                num_samples=config.get('verify_samples', 100)
-            )
-            log_dict.update({
-                'verification/validity_rate': verification_results['validity_rate'],
-                'verification/valid_count': verification_results['valid_count'],
-                'verification/total_count': verification_results['total_count']
-            })
-            print(f"Graph Verification: {verification_results['valid_count']}/{verification_results['total_count']} "
-                  f"valid ({verification_results['validity_rate']:.2%})")
+            if model_type == 'autoreg':
+                #posterior bits for autoregressive model
+                return_latents = (dataset_name in {"wd-articles", "wd-movies"})
+                stats = posterior_bits(
+                    model,
+                    test_loader.dataset,
+                    device,
+                    pad_id=SPECIAL["PAD"],
+                    sample_frac=config['sample_frac'],
+                    return_latents=return_latents,
+                    desc="Posterior compression"
+                )
+                print("\n[Posterior Compression on Test Set]")
+                print(f"  Avg total bits: {stats['avg_total_bits']:.2f}")
+                print(f"  Avg AR bits:    {stats['avg_ar_bits']:.2f}")
+                print(f"  Avg KL bits:    {stats['avg_kl_bits']:.2f}")
+                print(f"  Min / Max total bits: {stats['min_total_bits']:.2f} / {stats['max_total_bits']:.2f}")
+
+                wandb.log({
+                    "compression/avg_total_bits": stats["avg_total_bits"],
+                    "compression/avg_ar_bits":    stats["avg_ar_bits"],
+                    "compression/avg_kl_bits":    stats["avg_kl_bits"],
+                })
+                
+                #generate graphs conditioned on test entities and evaluate
+                generated_graphs = generate_test_graphs(model, test_loader, seq_len, SPECIAL, seq_to_triples,ENT_BASE, REL_BASE,beam_width=config['beam_width'], num_generated_test_graphs=config['num_generated_test_graphs'], device=device) 
+                print("\nExample graph (conditioned on test entities):")
+                print(ints_to_labels(generated_graphs,i2e,i2r)[0])
+                run_semantic_evaluation(ints_to_labels(generated_graphs, i2e, i2r),train_g, i2e, i2r, verifier, title="graphs conditioned on test entities")
+                #generate graphs from standard normal and evaluate
+                z_rand = torch.randn(config['num_generated_latent_graphs'], config['d_latent'], device=device)
+                latent_graphs = decode_latent(model, z_rand, seq_len, SPECIAL, seq_to_triples,ENT_BASE, REL_BASE, beam=1)
+                print("\nExample graph (random latent):")
+                print(ints_to_labels(latent_graphs, i2e, i2r)[0])
+                run_semantic_evaluation(ints_to_labels(latent_graphs, i2e, i2r), train_g, i2e, i2r, verifier, title="graphs from random latent")
+
+            else:
+                verification_results = sample_and_verify(
+                    model, config, verifier, i2e, i2r, device, 
+                    num_samples=config.get('verify_samples', 100)
+                )
+                log_dict.update({
+                    'verification/validity_rate': verification_results['validity_rate'],
+                    'verification/valid_count': verification_results['valid_count'],
+                    'verification/total_count': verification_results['total_count']
+                })
+                print(f"Graph Verification: {verification_results['valid_count']}/{verification_results['total_count']} "
+                    f"valid ({verification_results['validity_rate']:.2%})")
         
         wandb.log(log_dict)
         
         print(f"Train Loss: {train_loss:.4f} (Recon: {train_recon_loss:.4f}, KL: {train_kl_loss:.4f})")
         print(f"Val Loss: {val_loss:.4f} (Recon: {val_recon_loss:.4f}, KL: {val_kl_loss:.4f})")
         
-        if config.get('lr_scheduler', False):
-            scheduler.step(val_loss)
-        
+        if scheduler is not None:
+            if config.get('lr_scheduler', False):
+                if model_type == 'autoreg':
+                    scheduler.step() 
+                else:
+                    scheduler.step(val_loss)
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             # Handle DataParallel when saving
@@ -327,12 +530,14 @@ def main():
                 'epoch': epoch + 1,
                 'model_state_dict': model_state,
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': (scheduler.state_dict() if scheduler is not None else None),
                 'val_loss': val_loss,
                 'config': config
             }
             torch.save(
                 checkpoint,
-                os.path.join(args.checkpoint_dir, f'best_model.pt')
+                os.path.join(args.checkpoint_dir, f'best_model.pt'), _use_new_zipfile_serialization=False
+
             )
             print(f"Saved best model with validation loss: {val_loss:.4f}")
         
@@ -343,12 +548,13 @@ def main():
                 'epoch': epoch + 1,
                 'model_state_dict': model_state,
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': (scheduler.state_dict() if scheduler is not None else None), 
                 'val_loss': val_loss,
                 'config': config
             }
             torch.save(
                 checkpoint,
-                os.path.join(args.checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pt')
+                os.path.join(args.checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pt'),     _use_new_zipfile_serialization=False
             )
     
     # Final evaluation
@@ -385,18 +591,58 @@ def main():
     
     # Final verification
     if verifier:
-        final_verification = sample_and_verify(
-            model, config, verifier, i2e, i2r, device,
-            num_samples=config.get('verify_samples', 100)
-        )
-        print(f"Final generation validity: {final_verification['validity_rate']:.2%} "
-              f"({final_verification['valid_count']}/{final_verification['total_count']})")
-        
-        log_dict.update({
-            f'final_{eval_set_name}/validity_rate': final_verification['validity_rate'],
-            f'final_{eval_set_name}/valid_count': final_verification['valid_count'],
-            f'final_{eval_set_name}/total_count': final_verification['total_count']
-        })
+        if model_type == 'autoreg':
+            return_latents = (dataset_name in {"wd-articles", "wd-movies"})
+            stats = posterior_bits(
+                model,
+                test_loader.dataset,
+                device,
+                pad_id=SPECIAL["PAD"],
+                sample_frac=config['sample_frac'],
+                return_latents=return_latents,
+                desc="Posterior compression"
+            )
+            print("\n[Final Posterior Compression on Test Set]")
+            print(f" Final  Avg total bits: {stats['avg_total_bits']:.2f}")
+            print(f" Final Avg AR bits:    {stats['avg_ar_bits']:.2f}")
+            print(f" Final Avg KL bits:    {stats['avg_kl_bits']:.2f}")
+            print(f" Final Min / Max total bits: {stats['min_total_bits']:.2f} / {stats['max_total_bits']:.2f}")
+
+            wandb.log({
+                "compression/avg_total_bits": stats["avg_total_bits"],
+                "compression/avg_ar_bits":    stats["avg_ar_bits"],
+                "compression/avg_kl_bits":    stats["avg_kl_bits"],
+            })
+            
+            generated_graphs = generate_test_graphs(model, test_loader, seq_len, SPECIAL, seq_to_triples,ENT_BASE, REL_BASE,beam_width=config['beam_width'], num_generated_test_graphs=config['num_generated_test_graphs'], device=device) 
+            print("\nExample graph (conditioned on test entities):")
+            print(ints_to_labels(generated_graphs,i2e,i2r)[0])
+            run_semantic_evaluation(ints_to_labels(generated_graphs, i2e, i2r),train_g, i2e, i2r, verifier, title="graphs conditioned on test entities")
+            z_rand = torch.randn(config['num_generated_latent_graphs'], config['d_latent'], device=device)
+            latent_graphs = decode_latent(model, z_rand, seq_len, SPECIAL, seq_to_triples,ENT_BASE, REL_BASE, beam=1)
+            print("\nExample graph (random latent):")
+            print(ints_to_labels(latent_graphs, i2e, i2r)[0])
+            run_semantic_evaluation(ints_to_labels(latent_graphs, i2e, i2r), train_g, i2e, i2r, verifier, title="graphs from random latent")
+            
+            decode_fn = lambda m, z, beam=1: decode_latent(m, z, seq_len, SPECIAL, seq_to_triples, ENT_BASE, REL_BASE, beam=beam)
+            div = count_unique_graphs(model, config['d_latent'], decode_fn, num_samples=config['num_diversity_samples'], beam=1)
+            wandb.log({"diversity/unique_graphs": len(div),
+                "diversity/ratio": len(div) / (100 if dataset_name=="wd-articles" else 10000)})
+
+
+        else:
+            final_verification = sample_and_verify(
+                model, config, verifier, i2e, i2r, device,
+                num_samples=config.get('verify_samples', 100)
+            )
+            print(f"Final generation validity: {final_verification['validity_rate']:.2%} "
+                f"({final_verification['valid_count']}/{final_verification['total_count']})")
+            
+            log_dict.update({
+                f'final_{eval_set_name}/validity_rate': final_verification['validity_rate'],
+                f'final_{eval_set_name}/valid_count': final_verification['valid_count'],
+                f'final_{eval_set_name}/total_count': final_verification['total_count']
+            })
     
     wandb.log(log_dict)
     print("="*50)
