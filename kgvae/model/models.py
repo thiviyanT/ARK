@@ -253,5 +253,95 @@ class KGVAE(nn.Module):
         subjects = torch.argmax(subject_logits, dim=-1)
         relations = torch.argmax(relation_logits, dim=-1)
         objects = torch.argmax(object_logits, dim=-1)
-        
+
         return torch.stack([subjects, relations, objects], dim=-1)
+    
+    
+    
+class AutoRegDecoder(nn.Module):
+    def __init__(self, d_model, nhead, num_layers, seq_len, vocab_size, latent_dim):
+        super().__init__()
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(seq_len,   d_model)
+        self.z_proj  = nn.Linear(latent_dim,   d_model)
+        layer = nn.TransformerDecoderLayer(d_model, nhead, batch_first=True)
+        self.txf = nn.TransformerDecoder(layer, num_layers)
+        self.out = nn.Linear(d_model, vocab_size)
+
+    def forward(self, z, tgt):
+        B, L = tgt.shape
+        tok = self.tok_emb(tgt)
+        pos = self.pos_emb(torch.arange(L, device=z.device)).unsqueeze(0)
+        mem = self.z_proj(z).unsqueeze(1).repeat(1, L, 1)
+        mask = torch.triu(torch.ones(L, L, device=z.device, dtype=torch.bool), 1)
+        return self.out(self.txf(tok + pos, mem, tgt_mask=mask))
+
+class AutoRegEncoder(nn.Module):
+    def __init__(self, num_entities, num_relations, d_model, nhead, latent_dim,
+                 pad_eid=None, pad_rid=None, n_layers=2):
+        super().__init__()
+        self.pad_rid = pad_rid
+        self.e_emb = nn.Embedding(num_entities,  d_model, padding_idx=pad_eid)
+        self.r_emb = nn.Embedding(num_relations, d_model, padding_idx=pad_rid)
+        layer = nn.TransformerEncoderLayer(d_model*3, nhead, batch_first=True)
+        self.txf  = nn.TransformerEncoder(layer, n_layers)
+        self.mu   = nn.Linear(d_model*3, latent_dim)
+        self.logv = nn.Linear(d_model*3, latent_dim)
+
+    def forward(self, triples):  # (B, T, 3)
+        B, T, _ = triples.shape
+        h = self.e_emb(triples[:, :, 0])
+        r = self.r_emb(triples[:, :, 1])
+        t = self.e_emb(triples[:, :, 2])
+        x = torch.cat([h, r, t], -1)
+
+        if self.pad_rid is not None:
+            mask = triples[:, :, 1] != self.pad_rid              
+            x = self.txf(x, src_key_padding_mask=~mask)
+            denom = mask.sum(1, keepdim=True).clamp(min=1).unsqueeze(-1)
+            x = (x * mask.unsqueeze(-1)).sum(1) / denom.squeeze(-1)
+        else:
+            x = self.txf(x).mean(1)
+
+        mu, logv = self.mu(x), self.logv(x)
+        z = mu + torch.randn_like(mu) * torch.exp(0.5 * logv)
+        return z, mu, logv
+    
+    
+class AutoRegModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        self.enc = AutoRegEncoder(
+            num_entities=config["n_entities"],
+            num_relations=config["n_relations"],
+            d_model=config["d_model"],
+            nhead=config["n_heads"],
+            latent_dim=config["d_latent"],
+            pad_eid=config.get("pad_eid", None), #this needs to be changed or set in the config
+            pad_rid=config.get("pad_rid", None), #this needs to be changed or set in the config
+            n_layers=config.get("n_layers", 2)
+        )
+
+        self.dec = AutoRegDecoder(
+            d_model=config["d_model"],
+            nhead=config["n_heads"],
+            num_layers=config["n_layers"],
+            seq_len=config["seq_len"],
+            vocab_size=config["vocab_size"],
+            latent_dim=config["d_latent"]
+        )
+    
+    # def forward(self, triples, seq_in):
+    #     z, mu, logvar = self.encoder(triples)
+    #     logits = self.decoder(z, seq_in)
+    #     return {
+    #         "logits": logits,
+    #         "mu": mu,
+    #         "logvar": logvar
+    #     }
+    def forward(self, triples, seq_in):
+        z, mu, logv = self.enc(triples)
+        logits = self.dec(z, seq_in)
+        return logits, mu, logv    
