@@ -37,3 +37,7 @@ verify_samples: 10000  # Number of samples to verify
 
 # Evaluation settings
 use_test_for_final_eval: false  # If true, uses test set for final evaluation (WARNING: only for final runs!)
+
+# Compression bits estimation
+compression_scoring_mode: sparse  # Options: sparse (default, only edges observed), dense (full graph)
+compression_log_every: 10  # Compute and log compression bits every N epochs
