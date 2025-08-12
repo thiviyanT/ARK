@@ -59,6 +59,8 @@ def train_epoch(model, dataloader, optimizer, config, device):
     total_entity_loss = 0
     num_batches = 0
     
+    model_type = config.get('model_type', 'rescal_vae')
+    
     for batch_idx, batch_triples in enumerate(tqdm(dataloader, desc="Training")):
         # Process batch from IntelliGraphs DataLoader
         triples, nodes, mask = process_batch(batch_triples, config['max_edges'], config['max_nodes'], device)
@@ -67,14 +69,17 @@ def train_epoch(model, dataloader, optimizer, config, device):
         
         optimizer.zero_grad()
         
-        # RESCALVAE forward pass and loss computation
-        outputs = model(triples, nodes, mask)
-        loss_dict = model.compute_loss(outputs, triples, nodes, mask)
-        loss = loss_dict['loss']
-        recon_loss = loss_dict['edge_loss']
-        kl_loss = loss_dict['kl_loss']
-        entity_loss = loss_dict.get('entity_loss', 0)
-        total_entity_loss += entity_loss.item() if torch.is_tensor(entity_loss) else entity_loss
+        if model_type == 'rescal_vae':
+            # RESCALVAE forward pass and loss computation
+            outputs = model(triples, nodes, mask)
+            loss_dict = model.compute_loss(outputs, triples, nodes, mask)
+            loss = loss_dict['loss']
+            recon_loss = loss_dict['edge_loss']
+            kl_loss = loss_dict['kl_loss']
+            entity_loss = loss_dict.get('entity_loss', 0)
+            total_entity_loss += entity_loss.item() if torch.is_tensor(entity_loss) else entity_loss
+        else:
+            raise NotImplementedError(f"Model type '{model_type}' is not implemented")
         
         loss.backward()
         optimizer.step()
@@ -105,6 +110,8 @@ def validate(model, dataloader, config, device, compute_compression=False):
     total_graphs = 0
     num_batches = 0
     
+    model_type = config.get('model_type', 'rescal_vae')
+    
     with torch.no_grad():
         for batch_triples in tqdm(dataloader, desc="Validation"):
             # Process batch from IntelliGraphs DataLoader
@@ -112,25 +119,28 @@ def validate(model, dataloader, config, device, compute_compression=False):
             triples = triples.to(device)
             mask = mask.to(device)
             
-            # RESCALVAE forward pass and loss computation
-            outputs = model(triples, nodes, mask)
-            loss_dict = model.compute_loss(outputs, triples, nodes, mask)
-            loss = loss_dict['loss']
-            recon_loss = loss_dict['edge_loss']
-            kl_loss = loss_dict['kl_loss']
-            entity_loss = loss_dict.get('entity_loss', 0)
-            total_entity_loss += entity_loss.item() if torch.is_tensor(entity_loss) else entity_loss
-            
-            # Compute compression bits if requested
-            if compute_compression:
-                scoring_mode = config.get('compression_scoring_mode', 'sparse')
-                compression_dict = model.compute_compression_bits(outputs, triples, nodes, 
-                                                                   scoring_mode=scoring_mode)
-                total_compression_bits += compression_dict['total_bits']
-                total_kl_bits += compression_dict['kl_bits']
-                total_edge_bits += compression_dict['edge_bits']
-                total_entity_bits += compression_dict['entity_bits']
-                total_graphs += compression_dict['batch_size']
+            if model_type == 'rescal_vae':
+                # RESCALVAE forward pass and loss computation
+                outputs = model(triples, nodes, mask)
+                loss_dict = model.compute_loss(outputs, triples, nodes, mask)
+                loss = loss_dict['loss']
+                recon_loss = loss_dict['edge_loss']
+                kl_loss = loss_dict['kl_loss']
+                entity_loss = loss_dict.get('entity_loss', 0)
+                total_entity_loss += entity_loss.item() if torch.is_tensor(entity_loss) else entity_loss
+                
+                # Compute compression bits if requested
+                if compute_compression:
+                    scoring_mode = config.get('compression_scoring_mode', 'sparse')
+                    compression_dict = model.compute_compression_bits(outputs, triples, nodes, 
+                                                                       scoring_mode=scoring_mode)
+                    total_compression_bits += compression_dict['total_bits']
+                    total_kl_bits += compression_dict['kl_bits']
+                    total_edge_bits += compression_dict['edge_bits']
+                    total_entity_bits += compression_dict['entity_bits']
+                    total_graphs += compression_dict['batch_size']
+            else:
+                raise NotImplementedError(f"Model type '{model_type}' is not implemented")
             
             total_loss += loss.item()
             total_recon_loss += recon_loss.item()
@@ -178,12 +188,13 @@ def final_validation(model, test_loader, val_loader, config, device, verifier, i
     if use_test:
         warnings.warn("Using TEST SET for final evaluation", UserWarning)
     
-    # Run final evaluation with compression bits
-    compute_final_compression = True
+    # Run final evaluation with compression bits for RESCAL-VAE
+    model_type = config.get('model_type', 'rescal_vae')
+    compute_final_compression = (model_type == 'rescal_vae')
     final_results = validate(model, eval_loader, config, device, compute_compression=compute_final_compression)
     
-    # Unpack results from RESCAL-VAE
-    if compute_final_compression:
+    # Unpack results based on model type
+    if model_type == 'rescal_vae' and compute_final_compression:
         (final_loss, final_recon_loss, final_kl_loss, final_entity_loss,
          final_compression_bits, final_kl_bits, final_edge_bits, final_entity_bits) = final_results
     else:
@@ -305,20 +316,26 @@ def main():
     if verifier is None:
         print(f"Warning: No verifier available for dataset {dataset_name}")
     
-    # Initialize RESCAL-VAE model
-    scoring_mode = config.get('compression_scoring_mode', 'sparse')
-    print(f"\n{'='*60}")
-    print(f"RESCAL-VAE Configuration:")
-    print(f"  Training/Evaluation scoring mode: {scoring_mode.upper()}")
-    print(f"  Compression logging every: {config.get('compression_log_every', 5)} epochs")
-    if scoring_mode == 'dense':
-        print(f"  WARNING: Dense scoring is memory intensive!")
-        print(f"  Total edges to score per graph: {config['max_nodes']}×{config['max_nodes']}×{config['n_relations']} = {config['max_nodes']*config['max_nodes']*config['n_relations']}")
+    # Initialize model based on config
+    model_type = config.get('model_type', 'rescal_vae')
+    
+    if model_type == 'rescal_vae':
+        scoring_mode = config.get('compression_scoring_mode', 'sparse')
+        print(f"\n{'='*60}")
+        print(f"RESCAL-VAE Configuration:")
+        print(f"  Training/Evaluation scoring mode: {scoring_mode.upper()}")
+        print(f"  Compression logging every: {config.get('compression_log_every', 5)} epochs")
+        if scoring_mode == 'dense':
+            print(f"  WARNING: Dense scoring is memory intensive!")
+            print(f"  Total edges to score per graph: {config['max_nodes']}×{config['max_nodes']}×{config['n_relations']} = {config['max_nodes']*config['max_nodes']*config['n_relations']}")
+        else:
+            print(f"  Efficient sparse scoring: Only {config['max_edges']} edges per graph")
+        print(f"{'='*60}\n")
+        model = RESCALVAE(config).to(device)
     else:
-        print(f"  Efficient sparse scoring: Only {config['max_edges']} edges per graph")
-    print(f"{'='*60}\n")
-    model = RESCALVAE(config).to(device)
-    print(f"Using model: RESCAL-VAE")
+        raise NotImplementedError(f"Model type '{model_type}' is not implemented. Only 'rescal_vae' is currently supported.")
+    
+    print(f"Using model: {model_type}")
     
     # Support multi-GPU training if available
     if torch.cuda.device_count() > 1:
@@ -345,9 +362,17 @@ def main():
         train_results = train_epoch(model, train_loader, optimizer, config, device)
         val_results = validate(model, val_loader, config, device)
         
-        # Unpack results from RESCAL-VAE
-        train_loss, train_recon_loss, train_kl_loss, train_entity_loss = train_results
-        val_loss, val_recon_loss, val_kl_loss, val_entity_loss = val_results
+        # Handle different return values based on model type
+        model_type = config.get('model_type', 'rescal_vae')
+        if model_type == 'rescal_vae':
+            train_loss, train_recon_loss, train_kl_loss, train_entity_loss = train_results
+            val_loss, val_recon_loss, val_kl_loss, val_entity_loss = val_results
+        else:
+            # For future model types that may not have entity loss
+            train_loss, train_recon_loss, train_kl_loss = train_results
+            val_loss, val_recon_loss, val_kl_loss = val_results
+            train_entity_loss = 0
+            val_entity_loss = 0
         
         # Log basic metrics
         log_dict = {
@@ -361,9 +386,10 @@ def main():
             'learning_rate': optimizer.param_groups[0]['lr']
         }
         
-        # Add entity loss
-        log_dict['train/entity_loss'] = train_entity_loss
-        log_dict['val/entity_loss'] = val_entity_loss
+        # Add entity loss for RESCALVAE
+        if model_type == 'rescal_vae':
+            log_dict['train/entity_loss'] = train_entity_loss
+            log_dict['val/entity_loss'] = val_entity_loss
         
         # Periodically verify generated graphs
         if verifier and (epoch + 1) % config.get('verify_every', 10) == 0:
