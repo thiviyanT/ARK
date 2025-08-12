@@ -1,9 +1,5 @@
 # Model architecture
-model_type: rescal_vae  # Options: kgvae, rescal_vae
-encoder_type: transformer
-decoder_type: transformer
 d_model: 512
-d_hidden: 512
 d_latent: 512
 n_layers: 4
 n_heads: 8
@@ -27,7 +23,6 @@ sampling_temperature: 1.0       # Temperature for probabilistic sampling (higher
 
 lr_scheduler: true
 save_every: 50
-num_workers: 4
 
 experiment_name: rescal_vae_wd_movies
 verify_every: 25  # Verify generated graphs every 25 epochs
