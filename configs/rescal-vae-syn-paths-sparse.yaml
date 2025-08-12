@@ -1,6 +1,7 @@
 # SPARSE scoring mode
 
 # Model architecture
+model_type: rescal_vae
 d_model: 768
 d_latent: 768
 n_layers: 3
