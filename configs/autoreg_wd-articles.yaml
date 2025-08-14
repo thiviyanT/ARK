@@ -1,32 +1,43 @@
+# Configuration for training an autoregressive model on WD articles dataset
+
+# Model architecture
 model_type: autoreg
-dataset: wd-articles
 d_model: 512
 d_latent: 128
 n_heads: 8
 n_layers: 6
 
+# Training parameters
 batch_size: 16
 learning_rate: 0.0001
-num_epochs: 3
-shuffle_train: false
-use_padding: true
-
-verify_every: 10
-
+num_epochs: 150
 beta0: 0.1
 beta1: 1.0
 
+# Dataset parameters
+dataset: wd-articles
+shuffle_train: true
+use_padding: true
+
+# Generation parameters
 num_diversity_samples: 100
 num_generated_test_graphs: 1000
 num_generated_latent_graphs: 1000
-
-beam_width: 4
-lr_scheduler: true
-save_every: 5
 sample_frac: 0.1
+beam_width: 4
+
+# Optimization settings
+lr_scheduler: true
+save_every: 50
 resume_from_checkpoint: false
 checkpoint_path: checkpoints/autoreg_wd_articles.pt
 
+# Experiment tracking
 experiment_name: autoreg_vae_wd_articles
+verify_every: 10
 
+# Evaluation settings
 use_test_for_final_eval: false  
+
+#Compression bits estimation
+compression_log_every: 10  
