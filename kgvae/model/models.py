@@ -357,6 +357,8 @@ class AutoRegModel(nn.Module):
         return total
     
     #calculate the posterior compression bits. We calculate the KL divergence and the autoregressive loss and divide by LN2 for each sequence
+    #KL term: how many bits to encode the latent representation
+    #AR term (autoregressive bits): how many bits to reconstruct the data given the latent
     @torch.no_grad()
     def posterior_bits(
         self,
