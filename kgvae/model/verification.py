@@ -1,6 +1,7 @@
 import torch
 from intelligraphs.verifier.synthetic import SynPathsVerifier, SynTIPRVerifier, SynTypesVerifier
 from intelligraphs.verifier.wikidata import WDMoviesVerifier, WDArticlesVerifier
+from intelligraphs.evaluators   import post_process_data, SemanticEvaluator
 
 
 def get_verifier(dataset_name):
@@ -117,3 +118,21 @@ def sample_and_verify(model, config, verifier, i2e, i2r, device, num_samples=100
         )
     
     return verification_results
+
+
+
+def run_semantic_evaluation(predicted_graphs_lbl, train_g, i2e, i2r, verifier, title):
+    gt_graphs_lbl = post_process_data(train_g, i2e, i2r)
+    evaluator     = SemanticEvaluator(
+        predicted_graphs_lbl, gt_graphs_lbl,
+        rule_checker    = verifier.check_rules_for_graph,
+        entity_labels   = i2e,
+        relation_labels = i2r
+    )
+    if not hasattr(evaluator, "organized_results"):
+        if   hasattr(evaluator, "organize_results"):  evaluator.organize_results()
+        elif hasattr(evaluator, "_organize_results"): evaluator._organize_results()
+        elif hasattr(evaluator, "evaluate_graphs"):   evaluator.evaluate_graphs()
+    print(f"\nSemantic evaluation – {title}:")
+    evaluator.print_results()
+    return evaluator
