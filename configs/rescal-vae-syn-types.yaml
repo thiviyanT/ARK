@@ -1,9 +1,6 @@
 # Model architecture
-model_type: rescal_vae  # Options: kgvae, rescal_vae
-encoder_type: transformer
-decoder_type: transformer
+model_type: rescal_vae
 d_model: 512
-d_hidden: 512
 d_latent: 512
 n_layers: 2
 n_heads: 8
@@ -29,7 +26,6 @@ sampling_temperature: 1.0       # Temperature for probabilistic sampling (higher
 
 lr_scheduler: true
 save_every: 50
-num_workers: 4
 
 experiment_name: rescal_vae_syn_types
 verify_every: 25  # Verify generated graphs every 25 epochs
@@ -37,3 +33,7 @@ verify_samples: 10000  # Number of samples to verify
 
 # Evaluation settings
 use_test_for_final_eval: false  # If true, uses test set for final evaluation (WARNING: only for final runs!)
+
+# Compression bits estimation
+compression_scoring_mode: sparse  # Options: sparse (default, only edges observed), dense (full graph)
+compression_log_every: 10  # Compute and log compression bits every N epochs

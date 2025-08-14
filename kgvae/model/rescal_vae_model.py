@@ -298,6 +298,9 @@ class RESCALVAE(nn.Module):
     - RESCAL scoring function
     - Type embeddings for distinguishing nodes and edges
     """
+    # Class constant for nats to bits conversion
+    LOG2 = torch.log(torch.tensor(2.0))
+    
     def __init__(self, config):
         super().__init__()
         
@@ -336,6 +339,10 @@ class RESCALVAE(nn.Module):
         
         # Store config
         self.config = config
+        
+        # Training scoring mode
+        self.training_scoring_mode = config.get('compression_scoring_mode', 'sparse')
+        print(f"[RESCAL-VAE] Initialized with {self.training_scoring_mode.upper()} scoring mode for training")
         
     def forward(self, triples, nodes, mask=None):
         """
@@ -379,27 +386,34 @@ class RESCALVAE(nn.Module):
         # Decode with node mask
         decoder_node_emb, entity_predictions = self.decoder(z, node_mask)
         
-        # Score - pass edge indices and entity embeddings for memory-efficient sparse scoring
-        # Use entity embeddings directly since triples contain entity IDs, not positions
-        decoder_scores = self.scoring_function(
-            decoder_node_emb, 
-            edge_indices=triples, 
-            entity_embeddings=self.node_embeddings
-        )
-        
-        # For encoder scores, also use sparse scoring with entity embeddings
-        encoder_scores = self.scoring_function(
-            encoder_node_emb, 
-            edge_indices=triples,
-            entity_embeddings=self.node_embeddings
-        )
+        # Choose scoring mode based on configuration
+        if self.training_scoring_mode == 'dense' and self.training:
+            # Dense scoring: compute scores for all possible edges
+            # WARNING: This is memory intensive!
+            # Returns [batch_size, n_relations, max_nodes, max_nodes]
+            decoder_scores = self.scoring_function(decoder_node_emb)
+            encoder_scores = self.scoring_function(encoder_node_emb)
+        else:
+            # Sparse scoring: only score existing edges (memory efficient)
+            # Returns [batch_size, max_edges]
+            decoder_scores = self.scoring_function(
+                decoder_node_emb, 
+                edge_indices=triples, 
+                entity_embeddings=self.node_embeddings
+            )
+            encoder_scores = self.scoring_function(
+                encoder_node_emb, 
+                edge_indices=triples,
+                entity_embeddings=self.node_embeddings
+            )
         
         return {
             'decoder_scores': decoder_scores,
             'entity_predictions': entity_predictions,
             'mu': mu,
             'logvar': logvar,
-            'encoder_scores': encoder_scores
+            'encoder_scores': encoder_scores,
+            'z': z  # Include z for compression bits calculation
         }
     
     def sample(self, batch_size, device, sampling_method=None, temperature=1.0):
@@ -496,6 +510,70 @@ class RESCALVAE(nn.Module):
         
         return torch.tensor(generated_triples, device=device)
     
+    def _compute_kl_divergence(self, mu, logvar, per_sample=False):
+        """
+        Compute KL divergence between latent distribution and standard normal.
+        
+        Args:
+            mu: Mean of latent distribution
+            logvar: Log variance of latent distribution
+            per_sample: If True, return average per sample. If False, return sum.
+        
+        Returns:
+            KL divergence loss
+        """
+        kl_sum = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        if per_sample:
+            batch_size = mu.size(0)
+            return kl_sum / batch_size
+        return kl_sum
+    
+    def _compute_entity_loss(self, entity_predictions, target_nodes, reduction='mean'):
+        """
+        Compute entity prediction loss.
+        
+        Args:
+            entity_predictions: Model's entity predictions
+            target_nodes: Ground truth nodes
+            reduction: 'mean' or 'sum'
+        
+        Returns:
+            Entity loss
+        """
+        return F.cross_entropy(
+            entity_predictions.reshape(-1, entity_predictions.size(-1)),
+            target_nodes.reshape(-1),
+            ignore_index=0,  # Ignore padding
+            reduction=reduction
+        )
+    
+    def _compute_sparse_edge_loss(self, scores, target_triples, reduction='mean'):
+        """
+        Compute edge loss for sparse scoring.
+        
+        Args:
+            scores: Edge scores [batch_size, num_edges]
+            target_triples: Ground truth triples
+            reduction: 'mean' or 'sum'
+        
+        Returns:
+            Edge loss
+        """
+        target_labels = (target_triples[:, :, 1] != 0).float()
+        
+        if reduction == 'mean':
+            edge_mask = (target_triples.sum(dim=-1) == 0)
+            edge_losses = F.binary_cross_entropy_with_logits(
+                scores, target_labels, reduction='none'
+            )
+            edge_losses = edge_losses.masked_fill(edge_mask, 0)
+            valid_edges = (~edge_mask).sum()
+            return edge_losses.sum() / valid_edges.clamp(min=1)
+        else:
+            return F.binary_cross_entropy_with_logits(
+                scores, target_labels, reduction='sum'
+            )
+    
     def compute_loss(self, outputs, target_triples, target_nodes, mask=None):
         """
         Compute VAE loss including reconstruction and KL divergence.
@@ -509,41 +587,33 @@ class RESCALVAE(nn.Module):
         Returns:
             Dictionary with loss components
         """
-        device = target_triples.device
-        batch_size = target_triples.size(0)
-        
-        # 1. KL Divergence Loss
-        kl_loss = -0.5 * torch.sum(
-            1 + outputs['logvar'] - outputs['mu'].pow(2) - outputs['logvar'].exp()
-        ) / batch_size
+        # 1. KL Divergence Loss (per sample for training)
+        kl_loss = self._compute_kl_divergence(
+            outputs['mu'], outputs['logvar'], per_sample=True
+        )
         
         # 2. Entity Prediction Loss
-        entity_loss = F.cross_entropy(
-            outputs['entity_predictions'].reshape(-1, outputs['entity_predictions'].size(-1)),
-            target_nodes.reshape(-1),
-            ignore_index=0,  # Ignore padding
-            reduction='mean'
+        entity_loss = self._compute_entity_loss(
+            outputs['entity_predictions'], target_nodes, reduction='mean'
         )
         
         # 3. Graph Reconstruction Loss (RESCAL scores)
-        # Since we're using sparse scoring, decoder_scores are [batch_size, num_edges]
-        num_edges = target_triples.size(1)
+        decoder_scores = outputs['decoder_scores']
         
-        # Create target labels and mask
-        target_labels = (target_triples[:, :, 1] != 0).float()  # 1 for real edges, 0 for padding
-        edge_mask = (target_triples.sum(dim=-1) == 0)  # True for padding
-        
-        # Compute loss per edge
-        edge_losses = F.binary_cross_entropy_with_logits(
-            outputs['decoder_scores'],
-            target_labels,
-            reduction='none'
-        )
-        
-        # Mask out padding positions
-        edge_losses = edge_losses.masked_fill(edge_mask, 0)
-        valid_edges = (~edge_mask).sum()
-        edge_loss = edge_losses.sum() / valid_edges.clamp(min=1)
+        # Check if we have dense or sparse scores
+        if len(decoder_scores.shape) == 4:
+            # Dense scores: [batch_size, n_relations, max_nodes, max_nodes]
+            target_adjacency = self.triples_to_adjacency(target_triples)
+            edge_loss = F.binary_cross_entropy_with_logits(
+                decoder_scores,
+                target_adjacency,
+                reduction='mean'
+            )
+        else:
+            # Sparse scores: [batch_size, num_edges]
+            edge_loss = self._compute_sparse_edge_loss(
+                decoder_scores, target_triples, reduction='mean'
+            )
         
         # Total loss with configurable weights
         beta = self.config.get('beta', 1e-4)  # KL weight
@@ -558,6 +628,168 @@ class RESCALVAE(nn.Module):
             'entity_loss': entity_loss,
             'kl_loss': kl_loss
         }
+    
+    def triples_to_adjacency(self, triples, num_nodes=None, num_relations=None):
+        """
+        Convert triples to multi-relational adjacency tensor.
+        
+        Args:
+            triples: [batch_size, num_triples, 3] tensor of (subject, relation, object)
+            num_nodes: Number of nodes (defaults to max_nodes)
+            num_relations: Number of relations (defaults to n_relations + 1 for padding)
+        
+        Returns:
+            Adjacency tensor [batch_size, num_relations, num_nodes, num_nodes]
+        """
+        batch_size = triples.size(0)
+        num_nodes = num_nodes or self.config['max_nodes']
+        # Include padding relation (same as model initialization)
+        num_relations = num_relations or (self.config['n_relations'] + 1)
+        device = triples.device
+        
+        # Initialize adjacency tensor
+        adj = torch.zeros(batch_size, num_relations, num_nodes, num_nodes, device=device)
+        
+        # Fill adjacency tensor from triples
+        for b in range(batch_size):
+            for t in range(triples.size(1)):
+                s, r, o = triples[b, t]
+                if r > 0:  # Skip padding (r=0)
+                    if s < num_nodes and o < num_nodes and r < num_relations:
+                        adj[b, r, s, o] = 1.0
+        
+        return adj
+    
+    def compute_compression_bits(self, outputs, target_triples, target_nodes, 
+                                 scoring_mode='sparse'):
+        """
+        Compute compression bits for graph structure following rate-distortion theory.
+        
+        Args:
+            outputs: Dictionary from forward pass
+            target_triples: Ground truth triples [batch_size, max_edges, 3]
+            target_nodes: Ground truth nodes [batch_size, max_nodes]
+            scoring_mode: 'sparse' (default) or 'dense' compression calculation
+        
+        Returns:
+            Dictionary with compression metrics in bits (totals for the batch)
+        """
+        # Use config to determine mode if not specified
+        if scoring_mode == 'default':
+            scoring_mode = self.config.get('compression_scoring_mode', 'sparse')
+        
+        # First term - KL divergence in nats (sum over batch)
+        kl_nats = self._compute_kl_divergence(
+            outputs['mu'], outputs['logvar'], per_sample=False
+        )
+        
+        if scoring_mode == 'dense':
+            # Dense multi-relational scoring (like in my original implementation)
+            return self._compute_compression_bits_dense(
+                outputs, target_triples, target_nodes, kl_nats
+            )
+        else:
+            # Sparse scoring (current efficient implementation)
+            return self._compute_compression_bits_sparse(
+                outputs, target_triples, target_nodes, kl_nats
+            )
+    
+    def _compute_compression_bits_sparse(self, outputs, target_triples, 
+                                          target_nodes, kl_nats):
+        """
+        Sparse compression bits calculation (current implementation).
+        Only scores edges that exist in the input.
+        """
+        # Second term - Edge reconstruction negative log-likelihood in nats
+        edge_nll_nats = self._compute_sparse_edge_loss(
+            outputs['decoder_scores'], target_triples, reduction='sum'
+        )
+        
+        # Third term - Entity prediction negative log-likelihood in nats
+        entity_nll_nats = self._compute_entity_loss(
+            outputs['entity_predictions'], target_nodes, reduction='sum'
+        )
+        
+        # Convert nats to bits (divide by ln(2))
+        log2 = self.LOG2.to(kl_nats.device)
+        kl_bits = kl_nats / log2
+        edge_nll_bits = edge_nll_nats / log2
+        entity_nll_bits = entity_nll_nats / log2
+        
+        # Total compression bits for the batch
+        total_bits = kl_bits + edge_nll_bits + entity_nll_bits
+        
+        return {
+            'total_bits': total_bits.item(),
+            'kl_bits': kl_bits.item(),
+            'edge_bits': edge_nll_bits.item(),
+            'entity_bits': entity_nll_bits.item(),
+            'batch_size': target_triples.size(0),
+            'scoring_mode': 'sparse'
+        }
+    
+    def _compute_compression_bits_dense(self, outputs, target_triples, 
+                                         target_nodes, kl_nats):
+        """
+        Dense compression bits calculation.
+        Scores all possible edges in the adjacency tensor.
+        """
+        batch_size = target_triples.size(0)
+        device = target_triples.device
+        
+        # Convert triples to dense adjacency tensor
+        target_adjacency = self.triples_to_adjacency(target_triples)
+        
+        # Get dense decoder scores from outputs
+        # If model was trained with dense mode, decoder_scores will already be dense
+        # If model was trained with sparse mode, we need to compute dense scores
+        decoder_scores = outputs['decoder_scores']
+        
+        if len(decoder_scores.shape) == 2:
+            # Sparse scores in outputs, need to compute dense scores for evaluation
+            # This happens when evaluating a sparse-trained model with dense compression
+            # WARNING: This will give misleading results as discussed
+            z = outputs.get('z')
+            if z is None:
+                raise ValueError("Need latent z to compute dense scores from sparse-trained model")
+            
+            # Decode and compute dense scores
+            decoder_node_emb, _ = self.decoder(z)
+            dense_scores = self.scoring_function(decoder_node_emb)
+        else:
+            # Already have dense scores from training
+            dense_scores = decoder_scores
+        
+        # Edge reconstruction loss on full adjacency tensor
+        edge_nll_nats = F.binary_cross_entropy_with_logits(
+            dense_scores,
+            target_adjacency,
+            reduction='sum'
+        )
+        
+        # Entity prediction loss (same as sparse)
+        entity_nll_nats = self._compute_entity_loss(
+            outputs['entity_predictions'], target_nodes, reduction='sum'
+        )
+        
+        # Convert nats to bits
+        log2 = self.LOG2.to(kl_nats.device)
+        kl_bits = kl_nats / log2
+        edge_nll_bits = edge_nll_nats / log2
+        entity_nll_bits = entity_nll_nats / log2
+        
+        # Total compression bits
+        total_bits = kl_bits + edge_nll_bits + entity_nll_bits
+        
+        return {
+            'total_bits': total_bits.item(),
+            'kl_bits': kl_bits.item(),
+            'edge_bits': edge_nll_bits.item(),
+            'entity_bits': entity_nll_bits.item(),
+            'batch_size': batch_size,
+            'scoring_mode': 'dense'
+        }
+    
     
     def discretize_output(self, outputs, input_triples, threshold=0.5):
         """
