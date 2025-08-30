@@ -1,11 +1,3 @@
-"""
-Latent space interpolation experiments for Knowledge Graph VAE models.
-
-We load trained VAE models and perform interpolation between learned latent
-representations to analyze whether the model has learned smooth transitions
-between different graph structures in the latent space.
-"""
-
 import argparse
 import torch
 import torch.nn as nn
@@ -20,6 +12,22 @@ from intelligraphs.data_loaders import load_data_as_list
 
 
 def load_model(checkpoint_dir, dataset, model_type, epoch=None, device=None):
+    """
+    Load a trained VAE model from checkpoint.
+    
+    Args:
+        checkpoint_dir: Directory containing model checkpoints
+        dataset: Name of the dataset (e.g., 'syn-paths')
+        model_type: Type of model ('autoreg' or 'rescal_vae')
+        epoch: Specific epoch to load, or None for best model
+        device: Device to load model on ('cuda' or 'cpu'), auto-detected if None
+    
+    Returns:
+        tuple: (model, config, checkpoint_path)
+            - model: Loaded model in eval mode
+            - config: Model configuration dictionary
+            - checkpoint_path: Path to loaded checkpoint file
+    """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     if epoch is None:
         ckpt_path = os.path.join(checkpoint_dir, f"{dataset}_{model_type}_best_model.pt")
@@ -43,6 +51,21 @@ def load_model(checkpoint_dir, dataset, model_type, epoch=None, device=None):
 
 @torch.no_grad()
 def random_steps_latent_autoreg(model, i2e, i2r, n_directions=20, epsilon=1.2, device=None):
+    """
+    Explore local latent space neighborhood by perturbing in random directions.
+    
+    Samples a random latent point z₀ and perturbs it in n_directions random unit
+    directions scaled by epsilon. Decodes each perturbed point and compares the
+    resulting graphs to understand local latent space structure.
+    
+    Args:
+        model: Trained autoregressive VAE model
+        i2e: Index-to-entity mapping dictionary
+        i2r: Index-to-relation mapping dictionary
+        n_directions: Number of random directions to explore
+        epsilon: Step size for perturbations
+        device: Device for computation, auto-detected if None
+    """
     m = model.module if isinstance(model, nn.DataParallel) else model
     config = m.config
     seq_len        = config["seq_len"]
@@ -79,20 +102,22 @@ def random_steps_latent_autoreg(model, i2e, i2r, n_directions=20, epsilon=1.2, d
         print(f"# Overlapping triples with z₀: {len(overlap)} / {denom}")
           
 @torch.no_grad()
-def smoothness_line_check_autoreg(
-    model,
-    i2e,
-    i2r,
-    steps: int = 10,
-    epsilon: float = 0.1,
-    device: str = None,
-    beam: int = 1,
-):
+def smoothness_line_check_autoreg(model, i2e, i2r, steps: int = 10, epsilon: float = 0.1, device: str = None, beam: int = 1):
     """
-    Walk in latent space from z0 along a single random unit direction with small step size `epsilon`.
-    At each step, decode and measure:
-      - overlap with previous step's triples  (local smoothness)
-      - overlap with the anchor z0 triples    (global drift)
+    Walk along a line in latent space to measure smoothness.
+    
+    Starting from a random point z₀, takes steps along a random unit direction,
+    decoding at each point. Measures both local smoothness (similarity to previous
+    step) and global drift (similarity to starting point).
+    
+    Args:
+        model: Trained autoregressive VAE model
+        i2e: Index-to-entity mapping dictionary
+        i2r: Index-to-relation mapping dictionary
+        steps: Number of steps to take along the line
+        epsilon: Step size in latent space
+        device: Device for computation, auto-detected if None
+        beam: Beam size for decoding (1 = greedy)
     """
     m = model.module if isinstance(model, nn.DataParallel) else model
     cfg = m.config
@@ -159,20 +184,27 @@ def smoothness_line_check_autoreg(
 
 
 @torch.no_grad()
-def latent_smoothness_score_autoreg(
-    model,
-    steps:int=10,
-    epsilon:float=0.1,
-    n_anchors:int=3,
-    n_dirs:int=3,
-    beam:int=1,
-    device:str=None,
-):
+def latent_smoothness_score_autoreg(model, steps:int=10, epsilon:float=0.1, n_anchors:int=3, n_dirs:int=3, beam:int=1, device:str=None):
     """
-    Returns (avg_local_jaccard, avg_global_jaccard).
-    Local = J(acc(step s), acc(step s-1))
-    Global = J(acc(step s), acc(anchor))
-    where acc(x) is the set of decoded triples at x.
+    Compute quantitative smoothness scores using Jaccard similarity.
+    
+    Performs multiple random walks from different anchor points in latent space,
+    computing Jaccard similarity between consecutive steps (local smoothness)
+    and between each step and the anchor (global consistency).
+    
+    Args:
+        model: Trained autoregressive VAE model
+        steps: Number of steps per walk
+        epsilon: Step size in latent space
+        n_anchors: Number of random starting points to test
+        n_dirs: Number of random directions per anchor
+        beam: Beam size for decoding (1 = greedy)
+        device: Device for computation, auto-detected if None
+    
+    Returns:
+        tuple: (avg_local_jaccard, avg_global_jaccard)
+            - avg_local_jaccard: Average Jaccard between consecutive steps
+            - avg_global_jaccard: Average Jaccard between steps and anchors
     """
     m = model.module if isinstance(model, nn.DataParallel) else model
     cfg = m.config
@@ -242,10 +274,26 @@ def latent_flip_rate_autoreg(
     device:str=None,
 ):
     """
-    Measures how often the decoded graph changes as you take ε-steps in latent space.
+    Measure discreteness of latent space by tracking graph changes.
+    
+    Walks through latent space with small steps and tracks how often the decoded
+    graph changes. High flip rates indicate discrete/non-smooth latent space,
+    while low flip rates suggest smooth interpolation. Basin length measures
+    the average number of consecutive steps producing identical graphs.
+    
+    Args:
+        model: Trained autoregressive VAE model
+        steps: Number of steps per walk
+        epsilon: Step size in latent space
+        n_anchors: Number of random starting points to test
+        n_dirs: Number of random directions per anchor
+        beam: Beam size for decoding (1 = greedy)
+        device: Device for computation, auto-detected if None
+    
     Returns:
-      flip_rate: fraction of step transitions that change the decoded set of triples
-      avg_basin: average contiguous run length with identical decoded graph
+        tuple: (flip_rate, avg_basin)
+            - flip_rate: Fraction of steps that change the decoded graph (0-1)
+            - avg_basin: Average number of consecutive steps with same graph
     """
     m = model.module if isinstance(model, nn.DataParallel) else model
     cfg = m.config
@@ -305,7 +353,23 @@ def latent_flip_rate_autoreg(
 
 
 def main():
-
+    """
+    Main entry point for latent space interpolation experiments.
+    
+    Loads a trained VAE model and runs various interpolation experiments to
+    analyze the structure and smoothness of the learned latent space.
+    Experiments include random perturbations, line walks, smoothness scoring,
+    and flip rate analysis across multiple epsilon values.
+    
+    Command-line Arguments:
+        --config: Path to model configuration YAML file (required)
+        --checkpoint-dir: Directory containing model checkpoints
+        --wandb-project: Weights & Biases project name for logging
+        --wandb-entity: W&B entity/username
+        --directions: Number of random directions for perturbation experiment
+        --epsilon: Base step size for interpolation (overridden in main loop)
+        --epoch: Specific epoch to load, or None for best model
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
