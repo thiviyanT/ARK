@@ -10,6 +10,61 @@ from kgvae.model.utils import seq_to_triples, ints_to_labels
 from intelligraphs.data_loaders import load_data_as_list
 
 
+def jaccard(a: set, b: set) -> float:
+    """
+    Calculate Jaccard similarity between two sets.
+    
+    Args:
+        a: First set to compare
+        b: Second set to compare
+    
+    Returns:
+        float: Jaccard similarity score between 0 and 1
+    """
+    if not a and not b: 
+        return 1.0
+    if not a or not b: 
+        return 0.0
+    intersection = len(a & b)
+    union = len(a | b)
+    return intersection / union
+
+
+def decode_to_triple_set(
+    model_unwrapped,
+    z: torch.Tensor,
+    seq_len: int,
+    special_tokens: dict,
+    entity_base_idx: int,
+    relation_base_idx: int,
+    beam: int = 1
+) -> set:
+    """
+    Decode a latent vector to a set of Knowledge Graph triples.
+    
+    Takes a latent representation and decodes it into a set of (head, relation, tail)
+    triples representing edges in a knowledge graph. The triples are returned as
+    integer IDs for efficient comparison.
+    
+    Args:
+        model_unwrapped: The unwrapped model (not DataParallel wrapped)
+        z: Latent vector to decode (shape: [latent_dim])
+        seq_len: Maximum sequence length for decoding
+        special_tokens: Dictionary of special tokens used in decoding
+        entity_base_idx: Base index for entity IDs in vocabulary
+        relation_base_idx: Base index for relation IDs in vocabulary
+        beam: Beam size for beam search decoding (1 = greedy)
+    
+    Returns:
+        set: Set of tuples, each containing (head_id, relation_id, tail_id) as integers
+    """
+    decoded_graph = model_unwrapped.decode_latent(
+        z.unsqueeze(0), seq_len, special_tokens, seq_to_triples, 
+        entity_base_idx, relation_base_idx, beam=beam
+    )[0]
+    return set(tuple(map(int, t)) for t in decoded_graph)
+
+
 
 def load_model(checkpoint_dir, dataset, model_type, epoch=None, device=None):
     """
@@ -216,22 +271,6 @@ def latent_smoothness_score_autoreg(model, steps:int=10, epsilon:float=0.1, n_an
     if device is None:
         device = next(model_unwrapped.parameters()).device
 
-    def decode_to_set(z):
-        # decode_latent returns triples as integer ids (h,r,t); we can compare in int space
-        decoded_graph = model_unwrapped.decode_latent(
-            z.unsqueeze(0), seq_len, special_tokens, seq_to_triples, entity_base_idx, relation_base_idx, beam=beam
-        )[0]
-        return set(tuple(map(int, t)) for t in decoded_graph)  # {(h,r,t), ...}
-
-    def jaccard(a:set, b:set):
-        if not a and not b: 
-            return 1.0
-        if not a or not b: 
-            return 0.0
-        inter = len(a & b)
-        union = len(a | b)
-        return inter / max(1, union)
-
     total_local = 0.0
     total_global = 0.0
     count_local = 0
@@ -239,7 +278,7 @@ def latent_smoothness_score_autoreg(model, steps:int=10, epsilon:float=0.1, n_an
 
     for _ in range(n_anchors):
         z0  = torch.randn(latent_dim, device=device)
-        anchor = decode_to_set(z0)
+        anchor = decode_to_triple_set(model_unwrapped, z0, seq_len, special_tokens, entity_base_idx, relation_base_idx, beam)
         for _ in range(n_dirs):
             direction = torch.randn(latent_dim, device=device)
             direction = direction / direction.norm().clamp_min(1e-12)
@@ -248,7 +287,7 @@ def latent_smoothness_score_autoreg(model, steps:int=10, epsilon:float=0.1, n_an
             # march: z_s = z0 + s*epsilon*d
             for s in range(1, steps+1):
                 z = z0 + (s * epsilon) * direction
-                cur = decode_to_set(z)
+                cur = decode_to_triple_set(model_unwrapped, z, seq_len, special_tokens, entity_base_idx, relation_base_idx, beam)
                 total_local  += jaccard(cur, prev)
                 total_global += jaccard(cur, anchor)
                 count_local  += 1
@@ -297,12 +336,6 @@ def latent_flip_rate_autoreg(model, steps:int=30, epsilon:float=0.05, n_anchors:
     if device is None:
         device = next(model_unwrapped.parameters()).device
 
-    def decode_set(z):
-        decoded_graph = model_unwrapped.decode_latent(
-            z.unsqueeze(0), seq_len, special_tokens, seq_to_triples, entity_base_idx, relation_base_idx, beam=beam
-        )[0]
-        return set(tuple(map(int, t)) for t in decoded_graph)
-
     total_flips = 0
     total_steps = 0
     all_basin_lengths = []
@@ -313,12 +346,12 @@ def latent_flip_rate_autoreg(model, steps:int=30, epsilon:float=0.05, n_anchors:
             direction = torch.randn(latent_dim, device=device)
             direction = direction / direction.norm().clamp_min(1e-12)
 
-            prev_set = decode_set(z0)
+            prev_set = decode_to_triple_set(model_unwrapped, z0, seq_len, special_tokens, entity_base_idx, relation_base_idx, beam)
             basin_len = 1
             last_was_flip = False
             for s in range(1, steps+1):
                 z = z0 + (s * epsilon) * direction
-                cur_set = decode_set(z)
+                cur_set = decode_to_triple_set(model_unwrapped, z, seq_len, special_tokens, entity_base_idx, relation_base_idx, beam)
                 flipped = int(cur_set != prev_set)
                 total_flips += flipped
                 total_steps += 1
