@@ -66,26 +66,26 @@ def random_steps_latent_autoreg(model, i2e, i2r, n_directions=20, epsilon=1.2, d
         epsilon: Step size for perturbations
         device: Device for computation, auto-detected if None
     """
-    m = model.module if isinstance(model, nn.DataParallel) else model
-    config = m.config
+    model_unwrapped = model.module if isinstance(model, nn.DataParallel) else model
+    config = model_unwrapped.config
     seq_len        = config["seq_len"]
     special_tokens = config["special_tokens"]
-    ENT_BASE       = config["ENT_BASE"]
-    REL_BASE       = config["REL_BASE"]
+    entity_base_idx       = config["ENT_BASE"]
+    relation_base_idx       = config["REL_BASE"]
     latent_dim     = config["d_latent"]
 
     if device is None:
-        device = next(m.parameters()).device
+        device = next(model_unwrapped.parameters()).device
     z0 = torch.randn(latent_dim, device=device)
     directions = torch.randn(n_directions, latent_dim, device=device)
     directions = directions / directions.norm(dim=1, keepdim=True).clamp_min(1e-12)
     perturbed_zs = z0.unsqueeze(0) + epsilon * directions 
-    ref_graphs = m.decode_latent(
-        z0.unsqueeze(0), seq_len, special_tokens, seq_to_triples, ENT_BASE, REL_BASE, beam=1
+    ref_graphs = model_unwrapped.decode_latent(
+        z0.unsqueeze(0), seq_len, special_tokens, seq_to_triples, entity_base_idx, relation_base_idx, beam=1
     )
     ref_triples = ints_to_labels(ref_graphs, i2e, i2r)[0]
-    decoded_graphs = m.decode_latent(
-        perturbed_zs, seq_len, special_tokens, seq_to_triples, ENT_BASE, REL_BASE, beam=1
+    decoded_graphs = model_unwrapped.decode_latent(
+        perturbed_zs, seq_len, special_tokens, seq_to_triples, entity_base_idx, relation_base_idx, beam=1
     )
     decoded_triples = ints_to_labels(decoded_graphs, i2e, i2r)
     print("\n=== Local Latent Neighborhood Exploration ===")
@@ -119,25 +119,25 @@ def smoothness_line_check_autoreg(model, i2e, i2r, steps: int = 10, epsilon: flo
         device: Device for computation, auto-detected if None
         beam: Beam size for decoding (1 = greedy)
     """
-    m = model.module if isinstance(model, nn.DataParallel) else model
-    cfg = m.config
-    seq_len        = cfg["seq_len"]
-    special_tokens = cfg["special_tokens"]
-    ENT_BASE       = cfg["ENT_BASE"]
-    REL_BASE       = cfg["REL_BASE"]
-    d_latent       = cfg["d_latent"]
+    model_unwrapped = model.module if isinstance(model, nn.DataParallel) else model
+    config = model_unwrapped.config
+    seq_len        = config["seq_len"]
+    special_tokens = config["special_tokens"]
+    entity_base_idx       = config["ENT_BASE"]
+    relation_base_idx       = config["REL_BASE"]
+    latent_dim       = config["d_latent"]
 
     if device is None:
-        device = next(m.parameters()).device
+        device = next(model_unwrapped.parameters()).device
 
     # Anchor and direction
-    z0  = torch.randn(d_latent, device=device)
-    dir = torch.randn(d_latent, device=device)
-    dir = dir / dir.norm().clamp_min(1e-12)
+    z0  = torch.randn(latent_dim, device=device)
+    direction = torch.randn(latent_dim, device=device)
+    direction = direction / direction.norm().clamp_min(1e-12)
 
     # Decode anchor
-    anchor_graph_int = m.decode_latent(
-        z0.unsqueeze(0), seq_len, special_tokens, seq_to_triples, ENT_BASE, REL_BASE, beam=beam
+    anchor_graph_int = model_unwrapped.decode_latent(
+        z0.unsqueeze(0), seq_len, special_tokens, seq_to_triples, entity_base_idx, relation_base_idx, beam=beam
     )
     anchor_graph = ints_to_labels(anchor_graph_int, i2e, i2r)[0]
 
@@ -155,9 +155,9 @@ def smoothness_line_check_autoreg(model, i2e, i2r, steps: int = 10, epsilon: flo
     denom_anchor = max(1, len(anchor_graph))
 
     for s in range(1, steps + 1):
-        z = z0 + (s * epsilon) * dir
-        dec_int = m.decode_latent(
-            z.unsqueeze(0), seq_len, special_tokens, seq_to_triples, ENT_BASE, REL_BASE, beam=beam
+        z = z0 + (s * epsilon) * direction
+        dec_int = model_unwrapped.decode_latent(
+            z.unsqueeze(0), seq_len, special_tokens, seq_to_triples, entity_base_idx, relation_base_idx, beam=beam
         )
         graph = ints_to_labels(dec_int, i2e, i2r)[0]
 
@@ -169,7 +169,7 @@ def smoothness_line_check_autoreg(model, i2e, i2r, steps: int = 10, epsilon: flo
         total_local  += local_overlap
         total_global += global_overlap
 
-        print(f"\n--- Step {s}: z = z₀ + {s}·ε·dir ---")
+        print(f"\n--- Step {s}: z = z₀ + {s}·ε·direction ---")
         for h, r, t in graph:
             print(f"({h}, {r}, {t})")
         print(f"Local smoothness (vs step {s-1}): {local_overlap:.2f}")
@@ -206,22 +206,22 @@ def latent_smoothness_score_autoreg(model, steps:int=10, epsilon:float=0.1, n_an
             - avg_local_jaccard: Average Jaccard between consecutive steps
             - avg_global_jaccard: Average Jaccard between steps and anchors
     """
-    m = model.module if isinstance(model, nn.DataParallel) else model
-    cfg = m.config
-    seq_len        = cfg["seq_len"]
-    special_tokens = cfg["special_tokens"]
-    ENT_BASE       = cfg["ENT_BASE"]
-    REL_BASE       = cfg["REL_BASE"]
-    d_latent       = cfg["d_latent"]
+    model_unwrapped = model.module if isinstance(model, nn.DataParallel) else model
+    config = model_unwrapped.config
+    seq_len        = config["seq_len"]
+    special_tokens = config["special_tokens"]
+    entity_base_idx       = config["ENT_BASE"]
+    relation_base_idx       = config["REL_BASE"]
+    latent_dim       = config["d_latent"]
     if device is None:
-        device = next(m.parameters()).device
+        device = next(model_unwrapped.parameters()).device
 
     def decode_to_set(z):
         # decode_latent returns triples as integer ids (h,r,t); we can compare in int space
-        g_int = m.decode_latent(
-            z.unsqueeze(0), seq_len, special_tokens, seq_to_triples, ENT_BASE, REL_BASE, beam=beam
+        decoded_graph = model_unwrapped.decode_latent(
+            z.unsqueeze(0), seq_len, special_tokens, seq_to_triples, entity_base_idx, relation_base_idx, beam=beam
         )[0]
-        return set(tuple(map(int, t)) for t in g_int)  # {(h,r,t), ...}
+        return set(tuple(map(int, t)) for t in decoded_graph)  # {(h,r,t), ...}
 
     def jaccard(a:set, b:set):
         if not a and not b: 
@@ -238,16 +238,16 @@ def latent_smoothness_score_autoreg(model, steps:int=10, epsilon:float=0.1, n_an
     count_global = 0
 
     for _ in range(n_anchors):
-        z0  = torch.randn(d_latent, device=device)
+        z0  = torch.randn(latent_dim, device=device)
         anchor = decode_to_set(z0)
         for _ in range(n_dirs):
-            d = torch.randn(d_latent, device=device)
-            d = d / d.norm().clamp_min(1e-12)
+            direction = torch.randn(latent_dim, device=device)
+            direction = direction / direction.norm().clamp_min(1e-12)
 
             prev = anchor
             # march: z_s = z0 + s*epsilon*d
             for s in range(1, steps+1):
-                z = z0 + (s * epsilon) * d
+                z = z0 + (s * epsilon) * direction
                 cur = decode_to_set(z)
                 total_local  += jaccard(cur, prev)
                 total_global += jaccard(cur, anchor)
@@ -264,15 +264,7 @@ def latent_smoothness_score_autoreg(model, steps:int=10, epsilon:float=0.1, n_an
 
 
 @torch.no_grad()
-def latent_flip_rate_autoreg(
-    model,
-    steps:int=30,
-    epsilon:float=0.05,
-    n_anchors:int=5,
-    n_dirs:int=4,
-    beam:int=1,
-    device:str=None,
-):
+def latent_flip_rate_autoreg(model, steps:int=30, epsilon:float=0.05, n_anchors:int=5, n_dirs:int=4, beam:int=1, device:str=None):
     """
     Measure discreteness of latent space by tracking graph changes.
     
@@ -295,37 +287,37 @@ def latent_flip_rate_autoreg(
             - flip_rate: Fraction of steps that change the decoded graph (0-1)
             - avg_basin: Average number of consecutive steps with same graph
     """
-    m = model.module if isinstance(model, nn.DataParallel) else model
-    cfg = m.config
-    seq_len        = cfg["seq_len"]
-    special_tokens = cfg["special_tokens"]
-    ENT_BASE       = cfg["ENT_BASE"]
-    REL_BASE       = cfg["REL_BASE"]
-    d_latent       = cfg["d_latent"]
+    model_unwrapped = model.module if isinstance(model, nn.DataParallel) else model
+    config = model_unwrapped.config
+    seq_len        = config["seq_len"]
+    special_tokens = config["special_tokens"]
+    entity_base_idx       = config["ENT_BASE"]
+    relation_base_idx       = config["REL_BASE"]
+    latent_dim       = config["d_latent"]
     if device is None:
-        device = next(m.parameters()).device
+        device = next(model_unwrapped.parameters()).device
 
     def decode_set(z):
-        g = m.decode_latent(
-            z.unsqueeze(0), seq_len, special_tokens, seq_to_triples, ENT_BASE, REL_BASE, beam=beam
+        decoded_graph = model_unwrapped.decode_latent(
+            z.unsqueeze(0), seq_len, special_tokens, seq_to_triples, entity_base_idx, relation_base_idx, beam=beam
         )[0]
-        return set(tuple(map(int, t)) for t in g)
+        return set(tuple(map(int, t)) for t in decoded_graph)
 
     total_flips = 0
     total_steps = 0
     all_basin_lengths = []
 
     for _ in range(n_anchors):
-        z0  = torch.randn(d_latent, device=device)
+        z0  = torch.randn(latent_dim, device=device)
         for _ in range(n_dirs):
-            d = torch.randn(d_latent, device=device)
-            d = d / d.norm().clamp_min(1e-12)
+            direction = torch.randn(latent_dim, device=device)
+            direction = direction / direction.norm().clamp_min(1e-12)
 
             prev_set = decode_set(z0)
             basin_len = 1
             last_was_flip = False
             for s in range(1, steps+1):
-                z = z0 + (s * epsilon) * d
+                z = z0 + (s * epsilon) * direction
                 cur_set = decode_set(z)
                 flipped = int(cur_set != prev_set)
                 total_flips += flipped
