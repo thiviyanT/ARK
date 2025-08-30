@@ -278,6 +278,7 @@ def latent_flip_rate_autoreg(
 
             prev_set = decode_set(z0)
             basin_len = 1
+            last_was_flip = False
             for s in range(1, steps+1):
                 z = z0 + (s * epsilon) * d
                 cur_set = decode_set(z)
@@ -287,10 +288,15 @@ def latent_flip_rate_autoreg(
                 if flipped:
                     all_basin_lengths.append(basin_len)
                     basin_len = 1
+                    last_was_flip = True
                 else:
                     basin_len += 1
+                    last_was_flip = False
                 prev_set = cur_set
-            all_basin_lengths.append(basin_len)  # close the last basin
+            # Only append the final basin if the last step wasn't a flip
+            # (if it was a flip, we already recorded that basin)
+            if not last_was_flip and basin_len > 0:
+                all_basin_lengths.append(basin_len)
 
     flip_rate = total_flips / max(1, total_steps)           # 0..1
     avg_basin = (sum(all_basin_lengths) / max(1, len(all_basin_lengths)))
