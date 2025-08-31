@@ -563,9 +563,11 @@ def main():
     
     for epoch in range(config['num_epochs']):
         print(f"\nEpoch {epoch + 1}/{config['num_epochs']}")
-        b = config['beta']
+        b = 1
         if model_type == 'autoreg':
             b = config['beta0'] + (config['beta1'] - config['beta0']) * epoch / config['num_epochs']
+        elif model_type == 'rescal_vae':
+            b = config["beta"]
 
         train_results = train_epoch(model, train_loader, optimizer, config, device,b)
         
