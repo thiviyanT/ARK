@@ -666,7 +666,7 @@ def main():
             }
             torch.save(
                 checkpoint,
-                os.path.join(args.checkpoint_dir, f'best_model.pt'), _use_new_zipfile_serialization=False
+                os.path.join(args.checkpoint_dir, f'{dataset_name}_{model_type}_best_model.pt'), _use_new_zipfile_serialization=False
 
             )
             print(f"Saved best model with validation loss: {val_loss:.4f}")
@@ -684,7 +684,7 @@ def main():
             }
             torch.save(
                 checkpoint,
-                os.path.join(args.checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pt'),     _use_new_zipfile_serialization=False
+                os.path.join(args.checkpoint_dir, f'{dataset_name}_{model_type}_checkpoint_epoch_{epoch+1}.pt'),     _use_new_zipfile_serialization=False
             )
     # Perform final validation
     final_metrics = final_validation(model, test_loader, val_loader, config, device, verifier, i2e, i2r, b=1.0, special_tokens=special_tokens, seq_len=seq_len, ENT_BASE=ENT_BASE, REL_BASE=REL_BASE, train_g=train_g)

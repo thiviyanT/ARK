@@ -38,7 +38,7 @@ experiment_name: autoreg_vae_syn_tipr
 verify_every: 10
 
 #Evaluation settings
-use_test_for_final_eval: false  
+use_test_for_final_eval: true  
 
 #Compression bits estimation
 compression_log_every: 10  
