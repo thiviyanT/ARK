@@ -563,7 +563,9 @@ def main():
     
     for epoch in range(config['num_epochs']):
         print(f"\nEpoch {epoch + 1}/{config['num_epochs']}")
-        b = config['beta0'] + (config['beta1'] - config['beta0']) * epoch / config['num_epochs']
+        b = config['beta']
+        if model_type == 'autoreg':
+            b = config['beta0'] + (config['beta1'] - config['beta0']) * epoch / config['num_epochs']
 
         train_results = train_epoch(model, train_loader, optimizer, config, device,b)
         
