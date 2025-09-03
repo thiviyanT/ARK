@@ -93,7 +93,7 @@ def ints_to_labels(graphs, i2e, i2r):
         print(f"[!] Skipped {skipped} invalid triples")
     return result
 
-def canonicalize(triples, i2e = None, i2r = None, mode="alpha_name"):
+def canonicalize(triples, i2e = None, i2r = None, mode="keep"):
     if mode == "keep":
         return triples
     return sorted(triples, key=lambda x: (i2e[x[0]], i2r[x[1]], i2e[x[2]]))
