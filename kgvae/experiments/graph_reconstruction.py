@@ -10,6 +10,7 @@ import argparse
 import os
 import yaml
 import torch
+import wandb
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader as PDataLoader
@@ -194,29 +195,38 @@ def reconstruct(model, loader, ds_cfg, max_batches=None, beam=1, device=None):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True, type=str, help="Path to YAML used to train")
-    ap.add_argument("--checkpoint-dir", default="checkpoints", type=str)
-    ap.add_argument("--epoch", type=int, default=None, help="Load a specific epoch instead of best")
-    ap.add_argument("--split", choices=["train", "val", "test"], default="val")
-    ap.add_argument("--beam", type=int, default=1, help="Beam width (1 = greedy)")
-    ap.add_argument("--max-batches", type=int, default=None, help="Limit for quick tests")
-    ap.add_argument("--batch-size", type=int, default=32)
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True, type=str, help="Path to YAML used to train")
+    parser.add_argument("--checkpoint-dir", default="checkpoints", type=str)
+    parser.add_argument('--wandb-project', type=str, default='submission', help='Weights & Biases project name')
+    parser.add_argument('--wandb-entity', type=str, default='a-vozikis-vrije-universiteit-amsterdam', help='W&B entity')
+    parser.add_argument("--epoch", type=int, default=None, help="Load a specific epoch instead of best")
+    parser.add_argument("--split", choices=["train", "val", "test"], default="val")
+    parser.add_argument("--beam", type=int, default=1, help="Beam width (1 = greedy)")
+    parser.add_argument("--max-batches", type=int, default=None, help="Limit for quick tests")
+    parser.add_argument("--batch-size", type=int, default=32)
+    args = parser.parse_args()
 
     with open(args.config, "r") as f:
-        cfg_yaml = yaml.safe_load(f)
+        config = yaml.safe_load(f)
 
-    assert cfg_yaml.get("model_type", "autoreg") == "autoreg", "This simple reconstruction script currently supports model_type=='autoreg'."
+    assert config.get("model_type", "autoreg") == "autoreg", "This simple reconstruction script currently supports model_type=='autoreg'."
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, model_cfg, ckpt_path = load_model(
-        args.checkpoint_dir, cfg_yaml["dataset"], "autoreg", epoch=args.epoch, device=device
+        args.checkpoint_dir, config["dataset"], "autoreg", epoch=args.epoch, device=device
     )
-    print(f"Loaded autoreg for {cfg_yaml['dataset']} from {ckpt_path} on {device}")
+    print(f"Loaded autoreg for {config['dataset']} from {ckpt_path} on {device}")
+
+    wandb.init(
+    project=args.wandb_project,
+    entity=args.wandb_entity,
+    config=config,
+    name=f"latent_interp_{config['dataset']}_{config.get('model_type','autoreg')}"
+)
 
     train_loader, val_loader, test_loader, ds_cfg = build_autoreg_dataset_loaders(
-        cfg_yaml["dataset"], cfg_yaml, batch_size=args.batch_size
+        config["dataset"], config, batch_size=args.batch_size
     )
 
     loader = {"train": train_loader, "val": val_loader, "test": test_loader}[args.split]
@@ -229,6 +239,8 @@ def main():
     print(f"Graphs evaluated : {stats['num_graphs']}")
     print(f"Avg Jaccard      : {stats['avg_jaccard']*100:.2f}%")
     print(f"Exact match rate : {stats['exact_match_rate']*100:.2f}%\n")
+    
+    wandb.finish()
 
 
 if __name__ == "__main__":
