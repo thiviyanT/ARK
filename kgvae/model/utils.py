@@ -93,7 +93,7 @@ def ints_to_labels(graphs, i2e, i2r):
         print(f"[!] Skipped {skipped} invalid triples")
     return result
 
-def canonicalize(triples, i2e = None, i2r = None, mode="alpha_name"):
+def canonicalize(triples, i2e = None, i2r = None, mode="keep"):
     if mode == "keep":
         return triples
     return sorted(triples, key=lambda x: (i2e[x[0]], i2r[x[1]], i2e[x[2]]))
@@ -110,7 +110,7 @@ def triples_to_seq(triples, special_tokens, ENT_BASE, REL_BASE, seq_len):
 
 #custom dataset class with ordering and padding
 class GraphSeqDataset(Dataset):
-    def __init__(self, graphs, i2e, i2r, triple_order="alpha_name", permute=False,
+    def __init__(self, graphs, i2e, i2r, triple_order="keep", permute=False,
                  use_padding=False, pad_eid=None, pad_rid=None, max_triples=None,
                  special_tokens=None, ent_base=None, rel_base=None, seq_len=None):
         self.use_padding = use_padding
