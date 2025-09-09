@@ -17,7 +17,7 @@ beta1: 1.0
 
 #Dataset parameters
 dataset: syn-tipr
-shuffle_train: true
+shuffle_train: false
 use_padding: false
 triple_order: keep #keep for keeping the dataset order as is or alpha_name for sorting categorically 
 
