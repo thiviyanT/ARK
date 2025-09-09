@@ -290,6 +290,8 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--split", choices=["train", "val", "test"], default="val")
+    parser.add_argument('--wandb-project', type=str, default='submission', help='Weights & Biases project name')
+    parser.add_argument('--wandb-entity', type=str, default='a-vozikis-vrije-universiteit-amsterdam', help='W&B entity')
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--beam", type=int, default=1)
     parser.add_argument("--max-batches", type=int, default=None)
@@ -304,6 +306,13 @@ def main():
     model, model_cfg, ckpt_path, vocabs = load_model(
         args.checkpoint_dir, config["dataset"], "autoreg", epoch=args.epoch, device=device
     )
+    
+    wandb.init(
+    project=args.wandb_project,
+    entity=args.wandb_entity,
+    config=config,
+    name=f"latent_interp_{config['dataset']}_{config.get('model_type','autoreg')}"
+)
     i2e, i2r = vocabs["i2e"], vocabs["i2r"]
 
     train_loader, val_loader, test_loader, ds_cfg = build_autoreg_dataset_loaders(
@@ -322,7 +331,7 @@ def main():
     print(f"Graphs evaluated : {stats['num_graphs']}", flush=True)
     print(f"Avg Jaccard      : {stats['avg_jaccard']*100:.2f}%", flush=True)
     print(f"Exact match rate : {stats['exact_match_rate']*100:.2f}%\n", flush=True)
-
+    wandb.finish()
 
 
 if __name__ == "__main__":
