@@ -43,5 +43,6 @@ use_test_for_final_eval: true
 #Compression bits estimation
 compression_log_every: 10
 
+#ablation study settings
 ablation_encoder: MLP 
 ablation_decoder: GRU
