@@ -405,6 +405,7 @@ class AutoRegModel(nn.Module):
     
     @torch.no_grad()
     def decode_latent(self, z, seq_len, special_tokens, seq_to_triples, ent_base, rel_base, beam=4):
+        self.eval()
         z = z.to(next(self.parameters()).device, dtype=torch.float32)
         return self.beam_generate (seq_len, special_tokens, seq_to_triples, z, ent_base, rel_base, beam=beam)
 

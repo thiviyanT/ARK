@@ -429,7 +429,7 @@ def main():
             graphs=train_g,
             i2e=i2e,
             i2r=i2r,
-            triple_order="alpha_name",
+            triple_order=config["triple_order"],
             permute=False,
             use_padding=use_padding,
             pad_eid=PAD_EID,
@@ -450,7 +450,7 @@ def main():
                 graphs=val_g,
                 i2e=i2e,
                 i2r=i2r,
-                triple_order="alpha_name",
+                triple_order=config['triple_order'],
                 permute=False,
                 use_padding=use_padding,
                 pad_eid=PAD_EID,
@@ -469,7 +469,7 @@ def main():
                 graphs=test_g,
                 i2e=i2e,
                 i2r=i2r,
-                triple_order="alpha_name",
+                triple_order=config['triple_order'],
                 permute=False,
                 use_padding=use_padding,
                 pad_eid=PAD_EID,
@@ -563,7 +563,11 @@ def main():
     
     for epoch in range(config['num_epochs']):
         print(f"\nEpoch {epoch + 1}/{config['num_epochs']}")
-        b = config['beta0'] + (config['beta1'] - config['beta0']) * epoch / config['num_epochs']
+        b = 1
+        if model_type == 'autoreg':
+            b = config['beta0'] + (config['beta1'] - config['beta0']) * epoch / config['num_epochs']
+        elif model_type == 'rescal_vae':
+            b = config["beta"]
 
         train_results = train_epoch(model, train_loader, optimizer, config, device,b)
         
@@ -666,7 +670,7 @@ def main():
             }
             torch.save(
                 checkpoint,
-                os.path.join(args.checkpoint_dir, f'best_model.pt'), _use_new_zipfile_serialization=False
+                os.path.join(args.checkpoint_dir, f'{dataset_name}_{model_type}_best_model.pt'), _use_new_zipfile_serialization=False
 
             )
             print(f"Saved best model with validation loss: {val_loss:.4f}")
@@ -684,7 +688,7 @@ def main():
             }
             torch.save(
                 checkpoint,
-                os.path.join(args.checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pt'),     _use_new_zipfile_serialization=False
+                os.path.join(args.checkpoint_dir, f'{dataset_name}_{model_type}_checkpoint_epoch_{epoch+1}.pt'),     _use_new_zipfile_serialization=False
             )
     # Perform final validation
     final_metrics = final_validation(model, test_loader, val_loader, config, device, verifier, i2e, i2r, b=1.0, special_tokens=special_tokens, seq_len=seq_len, ENT_BASE=ENT_BASE, REL_BASE=REL_BASE, train_g=train_g)
