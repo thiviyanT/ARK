@@ -8,9 +8,9 @@ n_heads: 8
 n_layers: 12
 
 # Training parameters
-batch_size: 8
+batch_size: 16
 learning_rate: 0.0001
-num_epochs: 2
+num_epochs: 150
 beta0: 0.1
 beta1: 1.0
 
@@ -25,7 +25,7 @@ num_diversity_samples: 100
 num_generated_test_graphs: 100
 num_generated_latent_graphs: 100
 sample_frac: 0.01
-beam_width: 3
+beam_width: 4
 
 # Optimization settings
 lr_scheduler: true
@@ -35,10 +35,10 @@ checkpoint_path: checkpoints/autoreg_wd_articles.pt
 
 # Experiment tracking
 experiment_name: autoreg_vae_wd_articles
-verify_every: 1
+verify_every: 20
 
 # Evaluation settings
 use_test_for_final_eval: true  
 
 #Compression bits estimation
-compression_log_every: 1
+compression_log_every: 20
