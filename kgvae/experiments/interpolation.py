@@ -433,8 +433,13 @@ def qualitative_latent_analysis_wd_movies(model, output_dir: str = "figures", n_
         return genres if genres else ['unknown']
 
     def get_primary_genre(genres: List[str]) -> str:
-        """Get the primary (first) genre for visualization."""
-        return genres[0] if genres else 'unknown'
+        """Get the primary genre for visualization, prioritizing target genres."""
+        # Check if any of the genres is in target_genres
+        for genre in genres:
+            if genre in target_genres:
+                return genre
+        # If no target genre found, return 'other'
+        return 'other'
 
     print("\n=== Preparing data for analysis ===")
     
@@ -446,6 +451,38 @@ def qualitative_latent_analysis_wd_movies(model, output_dir: str = "figures", n_
         print(f"Using {len(test_sample)} sampled test graphs")
 
     print("\n=== Extracting genres from dataset ===")
+    
+    # Define target genres to focus on
+    target_genres = [
+        'action film',
+        'comedy film', 
+        'drama film',
+        'horror film',
+        'romance film',
+        'musical film',
+        'science fiction film',
+        'Western film',
+        'Bollywood',
+        'documentary film'
+    ]
+    
+    # Define distinct colors for each genre for maximum contrast
+    distinct_colors = [
+        '#FF0000',  # Red - action film
+        '#FFD700',  # Gold - comedy film  
+        '#0000FF',  # Blue - drama film
+        '#000000',  # Black - horror film
+        '#FF69B4',  # Hot Pink - romance film
+        '#FF8C00',  # Dark Orange - musical film
+        '#00FF00',  # Lime Green - science fiction film
+        '#8B4513',  # Saddle Brown - Western film
+        '#9370DB',  # Medium Purple - Bollywood
+        '#00CED1'   # Dark Turquoise - documentary film
+    ]
+    
+    genre_colors = {genre: color for genre, color in zip(target_genres, distinct_colors)}
+    genre_colors['other'] = '#C0C0C0'  # Silver gray for other genres
+    
     all_genres_set = set()
     for graph in test_sample:
         graph_labels = ints_to_labels([graph], i2e, i2r)[0]
@@ -453,20 +490,10 @@ def qualitative_latent_analysis_wd_movies(model, output_dir: str = "figures", n_
         all_genres_set.update(genres)
     
     print(f"Found {len(all_genres_set)} unique genres in dataset")
-    print(f"Genre examples: {list(all_genres_set)[:10]}")
+    print(f"Target genres for visualization: {target_genres}")
     
-    # create color mapping for genres (use a colormap for many genres)
-    import matplotlib.cm as cm
-    unique_genres = sorted(list(all_genres_set))
+    unique_genres = target_genres  # Focus only on target genres
     n_genres = len(unique_genres)
-
-    # use distinct colors for small number of genres, otherwise use continuous colormap for many genres
-    if n_genres <= 20:
-        cmap = cm.get_cmap('tab20')
-        genre_colors = {genre: cmap(i/20) for i, genre in enumerate(unique_genres)}
-    else:
-        cmap = cm.get_cmap('hsv')
-        genre_colors = {genre: cmap(i/n_genres) for i, genre in enumerate(unique_genres)}
 
     print("\n=== Encoding graphs to latent space ===")
     
@@ -536,47 +563,63 @@ def qualitative_latent_analysis_wd_movies(model, output_dir: str = "figures", n_
 
     # plot t-SNE with actual genre colors
     print("\n=== Generating t-SNE visualization ===")
-    fig1, ax1 = plt.subplots(figsize=(12, 8))
+    fig1, ax1 = plt.subplots(figsize=(10, 10))  # Square figure
     
-    # plot points colored by primary genre
-    for genre in unique_genres[:20]:  # Limit legend to 20 genres for readability
+    # Plot points for each target genre
+    for genre in target_genres:
         mask = [g == genre for g in primary_genres]
         if any(mask):
             points = latent_2d[mask]
             ax1.scatter(points[:, 0], points[:, 1], 
-                       c=[genre_colors[genre]], 
+                       c=genre_colors[genre], 
                        label=genre, 
-                       alpha=0.6, 
-                       s=30)
+                       alpha=0.7, 
+                       s=50,
+                       edgecolors='white',
+                       linewidth=0.5)
     
-    # handle remaining genres if more than 20
-    if n_genres > 20:
-        other_mask = [g not in unique_genres[:20] for g in primary_genres]
-        if any(other_mask):
-            points = latent_2d[other_mask]
-            ax1.scatter(points[:, 0], points[:, 1], 
-                       c='gray', 
-                       label='Other genres', 
-                       alpha=0.4, 
-                       s=20)
+    # Plot 'other' genres
+    other_mask = [g == 'other' for g in primary_genres]
+    if any(other_mask):
+        points = latent_2d[other_mask]
+        ax1.scatter(points[:, 0], points[:, 1], 
+                   c=genre_colors['other'], 
+                   label='Other genres', 
+                   alpha=0.3, 
+                   s=20)
     
-    ax1.set_xlabel('t-SNE Component 1', fontsize=12)
-    ax1.set_ylabel('t-SNE Component 2', fontsize=12)
-    ax1.set_title(f'Latent Space Structure (wd-movies)', fontsize=14)
-    ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2 if n_genres > 10 else 1)
+    ax1.set_xlabel('t-SNE Component 1', fontsize=40)  # Much larger axis labels
+    ax1.set_ylabel('t-SNE Component 2', fontsize=40)  # Much larger axis labels
+    
+    # Increase tick label size
+    ax1.tick_params(axis='both', which='major', labelsize=14)
+    
+    # Legend inside the plot (upper right corner)
+    legend = ax1.legend(loc='upper right', 
+                       frameon=True, fancybox=True, shadow=True,
+                       fontsize=25, framealpha=0.95)
+    legend.get_frame().set_facecolor('white')
+    legend.get_frame().set_edgecolor('gray')
+    
+    # Make the plot square with equal aspect ratio
+    ax1.set_aspect('equal', adjustable='box')
+    
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'latent_tsne_movies.pdf'), dpi=300, bbox_inches='tight')
     plt.close()
 
     print("\n=== Generating interpolation path visualization ===")
     
-    # find two movies with different genres
+    # find two movies with different target genres
     genre_pairs = []
     for i, genres_i in enumerate(all_genres_list):
         for j, genres_j in enumerate(all_genres_list[i+1:], i+1):
-            # Check if genres are different
-            if set(genres_i).isdisjoint(set(genres_j)):
-                genre_pairs.append((i, j, genres_i[0], genres_j[0]))
+            # Check if both have target genres and they're different
+            target_i = [g for g in genres_i if g in target_genres]
+            target_j = [g for g in genres_j if g in target_genres]
+            
+            if target_i and target_j and set(target_i).isdisjoint(set(target_j)):
+                genre_pairs.append((i, j, target_i[0], target_j[0]))
                 if len(genre_pairs) >= 5:  # Get a few pairs to choose from
                     break
         if len(genre_pairs) >= 5:
@@ -605,7 +648,7 @@ def qualitative_latent_analysis_wd_movies(model, output_dir: str = "figures", n_
         # note: This is an approximation; proper way would be to retrain t-SNE
         interp_2d = tsne.fit_transform(np.vstack([latent_vectors, interp_points]))
         
-        fig2, ax2 = plt.subplots(figsize=(10, 8))
+        fig2, ax2 = plt.subplots(figsize=(10, 10))  # Square figure
 
         ax2.scatter(interp_2d[:len(latent_vectors), 0], 
                    interp_2d[:len(latent_vectors), 1], 
@@ -623,10 +666,19 @@ def qualitative_latent_analysis_wd_movies(model, output_dir: str = "figures", n_
         for i in [5, 10, 15]:
             ax2.scatter(path_2d[i, 0], path_2d[i, 1], c='orange', s=80, marker='o', zorder=4)
         
-        ax2.set_xlabel('t-SNE Component 1', fontsize=12)
-        ax2.set_ylabel('t-SNE Component 2', fontsize=12)
-        ax2.set_title('Linear Interpolation in Latent Space', fontsize=14)
-        ax2.legend()
+        ax2.set_xlabel('t-SNE Component 1', fontsize=40)
+        ax2.set_ylabel('t-SNE Component 2', fontsize=40)
+        
+        # Increase tick label size
+        ax2.tick_params(axis='both', which='major', labelsize=14)
+        
+        # Make the plot square with equal aspect ratio
+        ax2.set_aspect('equal', adjustable='box')
+        
+        # Larger legend text
+        ax2.legend(fontsize=25, loc='upper right', frameon=True, fancybox=True, 
+                  shadow=True, framealpha=0.95)
+        
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'latent_interpolation.pdf'), dpi=300, bbox_inches='tight')
         plt.close()
@@ -674,7 +726,6 @@ def qualitative_latent_analysis_wd_movies(model, output_dir: str = "figures", n_
             edge_labels = nx.get_edge_attributes(G, 'label')
             nx.draw_networkx_edge_labels(G, pos, edge_labels, font_size=6, ax=ax)
             
-            ax.set_title(f'α = {alpha}', fontsize=11, fontweight='bold')
             ax.axis('off')
 
             genres_text = ', '.join(decoded_genres[:3])  # Show up to 3 genres
@@ -684,7 +735,6 @@ def qualitative_latent_analysis_wd_movies(model, output_dir: str = "figures", n_
                    transform=ax.transAxes,
                    ha='center', fontsize=8, style='italic')
         
-        fig3.suptitle('Decoded Graphs Along Interpolation Path', fontsize=14, y=1.05)
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'interpolation_sequence.pdf'), dpi=300, bbox_inches='tight')
         plt.close()
