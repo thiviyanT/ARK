@@ -27,6 +27,7 @@ num_generated_latent_graphs: 100
 sample_frac: 0.01
 beam_width: 4
 
+
 # Optimization settings
 lr_scheduler: true
 save_every: 50
@@ -37,8 +38,14 @@ checkpoint_path: checkpoints/autoreg_wd_articles.pt
 experiment_name: autoreg_vae_wd_articles
 verify_every: 20
 
+
 # Evaluation settings
 use_test_for_final_eval: true  
 
 #Compression bits estimation
 compression_log_every: 20
+
+#ablation study settings
+ablation_encoder: MLP 
+ablation_decoder: GRU
+
