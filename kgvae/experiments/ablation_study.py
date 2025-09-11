@@ -1,3 +1,10 @@
+"""
+Ablation study experiments for Knowledge Graph VAE models.
+
+We will systematically analyze the contribution of different model components
+by removing or modifying them and measuring the impact on performance.
+"""
+
 import torch
 import torch.optim as optim
 import wandb
@@ -19,7 +26,7 @@ from torch.utils.data import DataLoader as PDataLoader
 
 
 from kgvae.model.rescal_vae_model import RESCALVAE
-from kgvae.model.models import AutoRegModel
+from kgvae.model.models_abl import AutoRegModel
 from kgvae.model.utils import (
     compute_kl_divergence,
     compute_reconstruction_loss,

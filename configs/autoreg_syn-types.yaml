@@ -16,8 +16,9 @@ beta1: 1.0
 
 #Dataset parameters
 dataset: syn-types
-shuffle_train: true
+shuffle_train: false
 use_padding: false
+triple_order: keep #keep for keeping the dataset order as is or alpha_name for sorting categorically 
 
 #Generation parameters
 num_diversity_samples: 10000
@@ -41,3 +42,7 @@ use_test_for_final_eval: true
 
 #Compression bits estimation
 compression_log_every: 10  
+
+#ablation study settings
+ablation_encoder: MLP 
+ablation_decoder: GRU

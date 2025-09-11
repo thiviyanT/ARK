@@ -10,7 +10,8 @@ import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 try:
     import scienceplots
-    plt.style.use(['science', 'ieee'])
+    plt.style.use(['science', 'ieee', 'no-latex'])
+
 except ImportError:
     print("SciencePlots not available, using default style")
 from sklearn.manifold import TSNE
@@ -20,6 +21,9 @@ from kgvae.model.rescal_vae_model import RESCALVAE
 from kgvae.model.models import AutoRegModel
 from kgvae.model.utils import seq_to_triples, ints_to_labels
 from intelligraphs.data_loaders import load_data_as_list
+from kgvae.model.verification import get_verifier, run_semantic_evaluation
+
+
 
 
 def jaccard(a: set, b: set) -> float:
@@ -94,26 +98,35 @@ def load_model(checkpoint_dir, dataset, model_type, epoch=None, device=None):
             - model: Loaded model in eval mode
             - config: Model configuration dictionary
             - checkpoint_path: Path to loaded checkpoint file
+            - vocabs: Dictionary of vocabularies (e.g., {'e2i', 'i2e', 'r2i', 'i2r'})
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     if epoch is None:
         ckpt_path = os.path.join(checkpoint_dir, f"{dataset}_{model_type}_best_model.pt")
     else:
         ckpt_path = os.path.join(checkpoint_dir, f"{dataset}_{model_type}_checkpoint_epoch_{epoch}.pt")
+
     ckpt = torch.load(ckpt_path, map_location=device)
     config = ckpt["config"]
     state = ckpt["model_state_dict"]
     if any(k.startswith("module.") for k in state):
         state = {k.replace("module.", "", 1): v for k, v in state.items()}
+
     if model_type == "autoreg":
         model = AutoRegModel(config).to(device)
     elif model_type == "rescal_vae":
         model = RESCALVAE(config).to(device)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
+
     model.load_state_dict(state)
     model.eval()
-    return model, config, ckpt_path
+
+    vocabs = ckpt.get("vocabs", None)
+    dataset_meta = ckpt.get("dataset_meta", None)
+
+    return model, config, ckpt_path, vocabs, dataset_meta
+
 
 
 @torch.no_grad()
@@ -406,7 +419,8 @@ def qualitative_latent_analysis_wd_movies(model, output_dir: str = "figures", n_
         device: Device for computation, auto-detected if None
     """
     import scienceplots
-    plt.style.use(['science', 'ieee'])
+    plt.style.use(['science', 'ieee', 'no-latex'])
+
     
     os.makedirs(output_dir, exist_ok=True)
 
@@ -557,8 +571,9 @@ def qualitative_latent_analysis_wd_movies(model, output_dir: str = "figures", n_
 
     # perform t-SNE
     print("\n=== Running t-SNE projection ===")
-    tsne = TSNE(n_components=2, perplexity=min(30, len(latent_vectors)-1), 
-                random_state=42, n_iter=1000)
+    tsne = TSNE(n_components=2, perplexity=min(30, len(latent_vectors)-1),
+            random_state=42, max_iter=1000)
+
     latent_2d = tsne.fit_transform(latent_vectors)
 
     # plot t-SNE with actual genre colors
@@ -725,7 +740,7 @@ def qualitative_latent_analysis_wd_movies(model, output_dir: str = "figures", n_
 
             edge_labels = nx.get_edge_attributes(G, 'label')
             nx.draw_networkx_edge_labels(G, pos, edge_labels, font_size=6, ax=ax)
-            
+
             ax.axis('off')
 
             genres_text = ', '.join(decoded_genres[:3])  # Show up to 3 genres
@@ -743,7 +758,6 @@ def qualitative_latent_analysis_wd_movies(model, output_dir: str = "figures", n_
     print("  - latent_tsne_movies.pdf")
     print("  - latent_interpolation.pdf") 
     print("  - interpolation_sequence.pdf")
-
 
 
 def main():
@@ -770,6 +784,7 @@ def main():
     parser.add_argument('--wandb-project', type=str, default='submission', help='Weights & Biases project name')
     parser.add_argument('--wandb-entity', type=str, default='a-vozikis-vrije-universiteit-amsterdam', help='W&B entity')
     parser.add_argument('--directions', type=int, default=20)
+
     parser.add_argument('--epsilon', type=float, default=0.1)
     parser.add_argument('--epoch', type=int, default=None, help='If set, load that epoch; else load best')
     args = parser.parse_args()
@@ -780,14 +795,23 @@ def main():
     dataset    = config['dataset']
     model_type = config.get('model_type', 'autoreg')
     device     = 'cuda' if torch.cuda.is_available() else 'cpu'
+    beam = config.get("beam_width", 1)
 
-    model, config, ckpt_path = load_model(
-        checkpoint_dir=args.checkpoint_dir,
-        dataset=dataset,
-        model_type=model_type,
-        epoch=args.epoch,
-        device=device,
-    )
+
+    model, config, ckpt_path, vocabs, _ = load_model(
+    checkpoint_dir=args.checkpoint_dir,
+    dataset=dataset,
+    model_type=model_type,
+    epoch=args.epoch,
+    device=device,
+)
+
+    if vocabs is not None:
+        i2e = vocabs.get('i2e')
+        i2r = vocabs.get('i2r')
+    else:
+        _, _, _, (e2i, i2e), (r2i, i2r), _, _ = load_data_as_list(dataset)
+
     wandb.init(
     project=args.wandb_project,
     entity=args.wandb_entity,
@@ -797,10 +821,20 @@ def main():
 
     kind = f"epoch {args.epoch}" if args.epoch is not None else "best"
     print(f"✅ Loaded {model_type} for {dataset} ({kind}) from {ckpt_path} on {device}")
+    if dataset == "wd-movies":
+        qualitative_latent_analysis_wd_movies(
+            model,
+            output_dir="figures",
+            n_samples=500,
+            use_all_test=False
+        )
 
     if model_type == "autoreg":
-        _, _, _, (e2i, i2e), (r2i, i2r), _, _ = load_data_as_list(dataset)
+        assert i2e is not None and i2r is not None, "Checkpoint missing vocabs; retrain.py must save them."
         for e in [0.02, 0.05, 0.07, 0.1, 0.12, 0.15, 0.17, 0.2]:
+        # for i in range(2, 101, 2):
+            # e = i / 100
+            # print(e)
             print("----------------------------------------------------------------------")
             print ("epsilon value is:", e)
             print("----------------------------------------------------------------------")
@@ -820,24 +854,24 @@ def main():
                 steps=10,             
                 epsilon=e, 
                 device=device,
-                beam=1
+                beam=beam
             )
             latent_smoothness_score_autoreg(
                 model,
                 steps=10,
-                epsilon=e,  # uses your existing flag
+                epsilon=e,
                 n_anchors=3,
                 n_dirs=3,
-                beam=1,
+                beam=beam,
                 device=device,
             )
             latent_flip_rate_autoreg(
             model,
             steps=30,
-            epsilon=e,  # reuse your flag
+            epsilon=e,
             n_anchors=5,
             n_dirs=4,
-            beam=1,
+            beam=beam,
             device=device,
             )
 

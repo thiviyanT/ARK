@@ -19,6 +19,7 @@ beta1: 1.0
 dataset: wd-movies
 shuffle_train: false
 use_padding: true
+triple_order: keep #keep for keeping the dataset order as is or alpha_name for sorting categorically 
 
 # Generation parameters
 num_diversity_samples: 1000
@@ -42,3 +43,6 @@ use_test_for_final_eval: true
 
 #Compression bits estimation
 compression_log_every: 10  
+
+ablation_encoder: MLP 
+ablation_decoder: GRU
