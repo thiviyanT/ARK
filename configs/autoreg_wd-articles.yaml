@@ -8,9 +8,9 @@ n_heads: 8
 n_layers: 12
 
 # Training parameters
-batch_size: 8
+batch_size: 16
 learning_rate: 0.0001
-num_epochs: 2
+num_epochs: 150
 beta0: 0.1
 beta1: 1.0
 
@@ -39,7 +39,6 @@ experiment_name: autoreg_vae_wd_articles
 verify_every: 20
 
 
-
 # Evaluation settings
 use_test_for_final_eval: true  
 
@@ -49,3 +48,4 @@ compression_log_every: 20
 #ablation study settings
 ablation_encoder: MLP 
 ablation_decoder: GRU
+

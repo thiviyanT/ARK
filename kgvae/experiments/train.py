@@ -659,15 +659,27 @@ def main():
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             # Handle DataParallel when saving
-            model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+            model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()            
+            vocabs = {
+        'e2i': e2i, 'i2e': i2e,
+        'r2i': r2i, 'i2r': i2r,
+    }
+            dataset_meta = {
+        'dataset': dataset_name,
+        'n_entities': len(i2e),
+        'n_relations': len(i2r),
+    }
             checkpoint = {
-                'epoch': epoch + 1,
-                'model_state_dict': model_state,
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': (scheduler.state_dict() if scheduler is not None else None),
-                'val_loss': val_loss,
-                'config': config
-            }
+        'epoch': epoch + 1,
+        'model_state_dict': model_state,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': (scheduler.state_dict() if scheduler is not None else None),
+        'val_loss': val_loss,
+        'config': config,
+        'vocabs': vocabs,
+        'dataset_meta': dataset_meta,
+    }
+
             torch.save(
                 checkpoint,
                 os.path.join(args.checkpoint_dir, f'{dataset_name}_{model_type}_best_model.pt'), _use_new_zipfile_serialization=False
@@ -678,14 +690,25 @@ def main():
         if (epoch + 1) % config.get('save_every', 10) == 0:
             # Handle DataParallel when saving
             model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+            vocabs = {
+        'e2i': e2i, 'i2e': i2e,
+        'r2i': r2i, 'i2r': i2r,
+    }
+            dataset_meta = {
+        'dataset': dataset_name,
+        'n_entities': len(i2e),
+        'n_relations': len(i2r),
+    }
             checkpoint = {
-                'epoch': epoch + 1,
-                'model_state_dict': model_state,
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': (scheduler.state_dict() if scheduler is not None else None), 
-                'val_loss': val_loss,
-                'config': config
-            }
+        'epoch': epoch + 1,
+        'model_state_dict': model_state,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': (scheduler.state_dict() if scheduler is not None else None), 
+        'val_loss': val_loss,
+        'config': config,
+        'vocabs': vocabs,
+        'dataset_meta': dataset_meta,
+    }
             torch.save(
                 checkpoint,
                 os.path.join(args.checkpoint_dir, f'{dataset_name}_{model_type}_checkpoint_epoch_{epoch+1}.pt'),     _use_new_zipfile_serialization=False
