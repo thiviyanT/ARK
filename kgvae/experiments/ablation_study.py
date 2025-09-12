@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader as PDataLoader
 
 
 from kgvae.model.rescal_vae_model import RESCALVAE
-from kgvae.model.models_abl import AutoRegModel
+from kgvae.model.models import AutoRegModel
 from kgvae.model.utils import (
     compute_kl_divergence,
     compute_reconstruction_loss,
