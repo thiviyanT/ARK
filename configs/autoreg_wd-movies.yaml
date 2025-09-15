@@ -2,7 +2,7 @@
 
 
 # Model architecture
-model_type: autoreg
+model_type: dec_only #can be autoreg or dec_only. The autoreg model uses the variational autoencoder architecture while the dec_only model uses a decoder-only architecture.
 d_model: 512
 d_latent: 64
 n_heads: 8
@@ -20,6 +20,7 @@ dataset: wd-movies
 shuffle_train: false
 use_padding: true
 triple_order: keep #keep for keeping the dataset order as is or alpha_name for sorting categorically 
+permute_triples: true  # whether to permute triples in each graph
 
 # Generation parameters
 num_diversity_samples: 1000
@@ -35,7 +36,7 @@ resume_from_checkpoint: false
 checkpoint_path: checkpoints/autoreg_wd_movies.pt
 
 # Experiment tracking
-experiment_name: autoreg_vae_wd_movies
+experiment_name: autoreg_vae_wd_movies_dec_only
 verify_every: 10
 
 # Evaluation settings
@@ -44,5 +45,7 @@ use_test_for_final_eval: true
 #Compression bits estimation
 compression_log_every: 10  
 
-ablation_encoder: MLP 
-ablation_decoder: GRU
+#ablation study settings
+#set to None if no ablation is needed
+# ablation_encoder: MLP 
+ablation_decoder: GRU #this can be used for both the autoreg and dec_only models. In both cases the GRU decoder is used.
