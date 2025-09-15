@@ -167,7 +167,7 @@ class ScoringFunction(nn.Module):
     def __init__(self, n_entities, n_relations, d_model):
         super().__init__()
         self.entity_embeddings = nn.Embedding(n_entities, d_model)
-        # self.relation_embeddings = nn.Embedding(n_relations, d_model, d_model)
+
         self.relation_embeddings = nn.Embedding(n_relations, d_model)
         
     def forward(self, subjects, relations, objects):
@@ -264,7 +264,91 @@ class KGVAE(nn.Module):
         return torch.stack([subjects, relations, objects], dim=-1)
     
     
+class AutoRegEncoderMLP(nn.Module):
+    def __init__(self,
+                 num_entities,
+                 num_relations,
+                 d_model,
+                 latent_dim,
+                 pad_eid=None,
+                 pad_rid=None,
+                 hidden=None,
+                 dropout=0.0,
+                 n_layers=2):          # <-- NEW
+        super().__init__()
+        self.pad_rid = pad_rid
+        self.e_emb = nn.Embedding(num_entities,  d_model, padding_idx=pad_eid)
+        self.r_emb = nn.Embedding(num_relations, d_model, padding_idx=pad_rid)
+
+        d_in = d_model * 3
+        hidden = hidden or max(d_in, d_model * 2)
+
+        layers = []
+        in_dim = d_in
+        for i in range(n_layers):
+            out_dim = hidden
+            layers.append(nn.Linear(in_dim, out_dim))
+            layers.append(nn.GELU())
+            if dropout and dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = out_dim
+        self.mlp = nn.Sequential(*layers)
+
+        self.mu   = nn.Linear(hidden, latent_dim)
+        self.logv = nn.Linear(hidden, latent_dim)
+
+    def forward(self, triples):
+        h = self.e_emb(triples[:, :, 0])
+        r = self.r_emb(triples[:, :, 1])
+        t = self.e_emb(triples[:, :, 2])
+        x = torch.cat([h, r, t], dim=-1)
+
+        if self.pad_rid is not None:
+            mask = (triples[:, :, 1] != self.pad_rid)
+            x = x * mask.unsqueeze(-1)
+            denom = mask.sum(dim=1, keepdim=True).clamp(min=1)
+            g = x.sum(dim=1) / denom
+        else:
+            g = x.mean(dim=1)
+
+        g  = self.mlp(g)
+        mu = self.mu(g)
+        logv = self.logv(g).clamp(-10, 10)
+        z = mu + torch.randn_like(mu) * torch.exp(0.5 * logv)
+        return z, mu, logv
+
+class AutoRegEncoder(nn.Module):
+    def __init__(self, num_entities, num_relations, d_model, nhead, latent_dim,
+                 pad_eid=None, pad_rid=None, n_layers=2):
+        super().__init__()
+        self.pad_rid = pad_rid
+        self.e_emb = nn.Embedding(num_entities,  d_model, padding_idx=pad_eid)
+        self.r_emb = nn.Embedding(num_relations, d_model, padding_idx=pad_rid)
+        layer = nn.TransformerEncoderLayer(d_model*3, nhead, batch_first=True)
+        self.txf  = nn.TransformerEncoder(layer, n_layers)
+        self.mu   = nn.Linear(d_model*3, latent_dim)
+        self.logv = nn.Linear(d_model*3, latent_dim)
+
+    def forward(self, triples):  # (B, T, 3)
+        B, T, _ = triples.shape
+        h = self.e_emb(triples[:, :, 0])
+        r = self.r_emb(triples[:, :, 1])
+        t = self.e_emb(triples[:, :, 2])
+        x = torch.cat([h, r, t], -1)
+
+        if self.pad_rid is not None:
+            mask = triples[:, :, 1] != self.pad_rid              
+            x = self.txf(x, src_key_padding_mask=~mask)
+            denom = mask.sum(1, keepdim=True).clamp(min=1).unsqueeze(-1)
+            x = (x * mask.unsqueeze(-1)).sum(1) / denom.squeeze(-1)
+        else:
+            x = self.txf(x).mean(1)
+
+        mu, logv = self.mu(x), self.logv(x)
+        z = mu + torch.randn_like(mu) * torch.exp(0.5 * logv)
+        return z, mu, logv
     
+
 class AutoRegDecoder(nn.Module):
     def __init__(self, d_model, nhead, num_layers, seq_len, vocab_size, latent_dim):
         super().__init__()
@@ -282,7 +366,6 @@ class AutoRegDecoder(nn.Module):
         mem = self.z_proj(z).unsqueeze(1).repeat(1, L, 1)
         mask = torch.triu(torch.ones(L, L, device=z.device, dtype=torch.bool), 1)
         return self.out(self.txf(tok + pos, mem, tgt_mask=mask))
-    
     
 class AutoRegDecoderGRU(nn.Module):
     def __init__(self, d_model, num_layers, seq_len, vocab_size, latent_dim, dropout=0.1, tie_weights=True):
@@ -310,86 +393,22 @@ class AutoRegDecoderGRU(nn.Module):
         h0 = torch.tanh(self.z_proj(z))     
         h0 = h0.unsqueeze(0).repeat(self.gru.num_layers, 1, 1)  
         y, _ = self.gru(x, h0)              
-        return self.out(y) 
-
-class AutoRegEncoder(nn.Module):
-    def __init__(self, num_entities, num_relations, d_model, nhead, latent_dim,
-                 pad_eid=None, pad_rid=None, n_layers=2):
-        super().__init__()
-        self.pad_rid = pad_rid
-        self.e_emb = nn.Embedding(num_entities,  d_model, padding_idx=pad_eid)
-        self.r_emb = nn.Embedding(num_relations, d_model, padding_idx=pad_rid)
-        layer = nn.TransformerEncoderLayer(d_model*3, nhead, batch_first=True)
-        self.txf  = nn.TransformerEncoder(layer, n_layers)
-        self.mu   = nn.Linear(d_model*3, latent_dim)
-        self.logv = nn.Linear(d_model*3, latent_dim)
-
-    def forward(self, triples):  
-        B, T, _ = triples.shape
-        h = self.e_emb(triples[:, :, 0])
-        r = self.r_emb(triples[:, :, 1])
-        t = self.e_emb(triples[:, :, 2])
-        x = torch.cat([h, r, t], -1)
-
-        if self.pad_rid is not None:
-            mask = triples[:, :, 1] != self.pad_rid              
-            x = self.txf(x, src_key_padding_mask=~mask)
-            denom = mask.sum(1, keepdim=True).clamp(min=1).unsqueeze(-1)
-            x = (x * mask.unsqueeze(-1)).sum(1) / denom.squeeze(-1)
-        else:
-            x = self.txf(x).mean(1)
-
-        mu, logv = self.mu(x), self.logv(x)
-        z = mu + torch.randn_like(mu) * torch.exp(0.5 * logv)
-        return z, mu, logv
-    
-    
-
-class AutoRegEncoderMLP(nn.Module):
-    def __init__(self, num_entities, num_relations, d_model, latent_dim,
-                 pad_eid=None, pad_rid=None, hidden=None, dropout=0.0):
-        super().__init__()
-        self.pad_rid = pad_rid
-        self.e_emb = nn.Embedding(num_entities,  d_model, padding_idx=pad_eid)
-        self.r_emb = nn.Embedding(num_relations, d_model, padding_idx=pad_rid)
-
-        d_in = d_model * 3
-        hidden = hidden or max(d_in, d_model * 2)
-
-        self.mlp = nn.Sequential(
-            nn.Linear(d_in, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-        )
-        self.mu   = nn.Linear(hidden, latent_dim)
-        self.logv = nn.Linear(hidden, latent_dim)
-
-    def forward(self, triples): 
-        h = self.e_emb(triples[:, :, 0])
-        r = self.r_emb(triples[:, :, 1])
-        t = self.e_emb(triples[:, :, 2])
-        x = torch.cat([h, r, t], dim=-1)       
-
-        if self.pad_rid is not None:
-            mask = (triples[:, :, 1] != self.pad_rid)       
-            x = x * mask.unsqueeze(-1)
-            denom = mask.sum(dim=1, keepdim=True).clamp(min=1)
-            g = x.sum(dim=1) / denom                        
-        else:
-            g = x.mean(dim=1)
-
-        g = self.mlp(g)                                      
-        mu   = self.mu(g)
-        logv = self.logv(g).clamp(-10, 10) 
-        z = mu + torch.randn_like(mu) * torch.exp(0.5 * logv)
-        return z, mu, logv
-
+        return self.out(y)                  
+ 
 class AutoRegModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.enc = AutoRegEncoder(
+            num_entities=config["n_entities"],
+            num_relations=config["n_relations"],
+            d_model=config["d_model"],
+            nhead=config["n_heads"],
+            latent_dim=config["d_latent"],
+            pad_eid=config.get("pad_eid", None),
+            pad_rid=config.get("pad_rid", None),
+            n_layers=config.get("n_layers", 2)
+        )
         if config['ablation_encoder'] == 'MLP':
             print("Using MLP encoder")
             self.enc = AutoRegEncoderMLP(
@@ -399,18 +418,18 @@ class AutoRegModel(nn.Module):
                 latent_dim=config["d_latent"],
                 pad_eid=config.get("pad_eid"),
                 pad_rid=config.get("pad_rid"),
+                n_layers = config["n_layers"]
             )
-        else:
-            self.enc = AutoRegEncoder(
-                num_entities=config["n_entities"],
-                num_relations=config["n_relations"],
-                d_model=config["d_model"],
-                nhead=config["n_heads"],
-                latent_dim=config["d_latent"],
-                pad_eid=config.get("pad_eid", None),
-                pad_rid=config.get("pad_rid", None),
-                n_layers=config.get("n_layers", 2)
-            )
+
+
+        self.dec = AutoRegDecoder(
+            d_model=config["d_model"],
+            nhead=config["n_heads"],
+            num_layers=config["n_layers"],
+            seq_len=config["seq_len"],
+            vocab_size=config["vocab_size"],
+            latent_dim=config["d_latent"]
+        )
         if config['ablation_decoder'] == 'GRU':
             print("Using GRU Decoder")
             self.dec = AutoRegDecoderGRU(
@@ -422,19 +441,9 @@ class AutoRegModel(nn.Module):
                 dropout=self.config.get("dec_dropout", 0.1),
                 tie_weights=self.config.get("tie_weights", True),
             )
-        else:
-            self.dec = AutoRegDecoder(
-                d_model=config["d_model"],
-                nhead=config["n_heads"],
-                num_layers=config["n_layers"],
-                seq_len=config["seq_len"],
-                vocab_size=config["vocab_size"],
-                latent_dim=config["d_latent"]
-            )
     def kl_mean(self,mu, logv):
         return -0.5 * torch.mean(1 + logv - mu.pow(2) - logv.exp())
     
-    #calculate the compression bits per sequence
     def bits_per_sequence(self, seq, z, pad_id=0):
         LN2 = math.log(2)
         seq = seq.unsqueeze(0).to(z.device)  
@@ -554,3 +563,203 @@ class AutoRegModel(nn.Module):
         z, mu, logv = self.enc(triples)
         logits = self.dec(z, seq_in)
         return logits, mu, logv    
+
+
+
+class DecoderOnlyGRU(nn.Module):
+    def __init__(self, d_model, num_layers, seq_len, vocab_size,
+                 dropout=0.1, tie_weights=True):
+        super().__init__()
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(seq_len, d_model)
+        self.gru = nn.GRU(
+            input_size=d_model,
+            hidden_size=d_model,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+        self.out = nn.Linear(d_model, vocab_size)
+        if tie_weights and self.out.weight.shape == self.tok_emb.weight.shape:
+            self.out.weight = self.tok_emb.weight  
+
+    def forward(self, seq_in): 
+        B, L = seq_in.shape
+        pos = torch.arange(L, device=seq_in.device).unsqueeze(0)
+        x = self.tok_emb(seq_in) + self.pos_emb(pos)     
+        y, _ = self.gru(x)                               
+        return self.out(y)                               
+    
+    
+
+class DecoderOnlyTransformer(nn.Module):
+    def __init__(self, d_model, nhead, num_layers, seq_len, vocab_size,
+                 dropout=0.1, tie_weights=True):
+        super().__init__()
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(seq_len, d_model)
+        layer = nn.TransformerEncoderLayer(d_model, nhead, batch_first=True, dropout=dropout)
+        self.txf = nn.TransformerEncoder(layer, num_layers)
+        self.out  = nn.Linear(d_model, vocab_size)
+        if tie_weights and self.out.weight.shape == self.tok_emb.weight.shape:
+            self.out.weight = self.tok_emb.weight  
+
+    def forward(self, seq_in):               
+        B, L = seq_in.shape
+        x = self.tok_emb(seq_in) + self.pos_emb(torch.arange(L, device=seq_in.device)).unsqueeze(0)
+        mask = torch.triu(torch.ones(L, L, device=seq_in.device, dtype=torch.bool), 1)
+        h = self.txf(x, mask)
+        return self.out(h)                   
+
+class DecOnlyModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        if config['ablation_decoder'] == 'GRU':
+            print("Using GRU Decoder")
+            self.dec = DecoderOnlyGRU(
+                d_model   = config["d_model"],
+                num_layers= config["n_layers"],
+                seq_len   = config["seq_len"],
+                vocab_size= config["vocab_size"],
+                dropout   = config.get("dec_dropout", 0.1),
+                tie_weights=config.get("tie_weights", True),
+            )
+        else:
+            self.dec = DecoderOnlyTransformer(
+                d_model   = config["d_model"],
+                nhead     = config["n_heads"],
+                num_layers= config["n_layers"],
+                seq_len   = config["seq_len"],
+                vocab_size= config["vocab_size"],
+                dropout   = config.get("dec_dropout", 0.1),
+                tie_weights=config.get("tie_weights", True),
+            )
+
+    def forward(self, triples_or_seq, seq_in=None):
+        """
+        Support both calls:
+          - forward(seq) → pass a sequence directly
+          - forward(triples, seq) → ignore triples, use seq
+        """
+        if seq_in is None:  
+            seq = triples_or_seq
+        else:
+            seq = seq_in
+        return self.dec(seq)
+
+    @torch.no_grad()
+    def generate(
+        self,
+        seq_len,
+        special_tokens,
+        device=None,
+        batch_size=1,
+        beam=1,
+        sample=False,
+        temperature=1.0,
+        top_p=0.0,
+        top_k=0,
+    ):
+        """
+        If sample=False and beam==1 -> greedy (still identical across batch).
+        For diversity, use sample=True (recommended for dec-only).
+        """
+        device = device or next(self.parameters()).device
+        B = batch_size
+        BOS = torch.full((B, 1), special_tokens["BOS"], dtype=torch.long, device=device)
+        seq = BOS
+
+        for _ in range(seq_len - 1):
+            logits = self.dec(seq)[:, -1]               
+            if sample:
+                if temperature and temperature != 1.0:
+                    logits = logits / float(temperature)
+                probs = F.softmax(logits, dim=-1)
+
+                if top_k and top_k > 0:
+                    topk_vals, topk_idx = probs.topk(top_k, dim=-1)
+                    mask = torch.zeros_like(probs).scatter_(-1, topk_idx, 1.0)
+                    probs = probs * mask
+                    probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+                if top_p and 0.0 < top_p < 1.0:
+                    sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)
+                    cdf = sorted_probs.cumsum(dim=-1)
+                    cutoff = (cdf > top_p)
+                    cutoff[..., 1:] = cutoff[..., :-1].clone()
+                    cutoff[..., 0] = False
+                    sorted_probs[cutoff] = 0
+                    sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                    next_ids = torch.zeros(B, 1, dtype=torch.long, device=device)
+                    for b in range(B):
+                        nid = torch.multinomial(sorted_probs[b], 1)
+                        next_ids[b, 0] = sorted_idx[b, nid]
+                else:
+                    next_ids = torch.multinomial(probs, 1) 
+
+            else:
+                next_ids = logits.argmax(dim=-1, keepdim=True)  
+
+            seq = torch.cat([seq, next_ids], dim=1)
+
+            if (seq[:, -1] == special_tokens["EOS"]).all():
+                break
+        if seq.size(1) < seq_len:
+            pad = seq_len - seq.size(1)
+            pad_ids = torch.full((B, pad), special_tokens["EOS"], dtype=torch.long, device=device)
+            seq = torch.cat([seq, pad_ids], dim=1)
+        elif seq.size(1) > seq_len:
+            seq = seq[:, :seq_len]
+
+        return seq  
+    
+    def bits_per_sequence(self, seq, pad_id=0):
+        """Compute AR bits for a single sequence with teacher forcing."""
+        LN2 = math.log(2)
+        seq = seq.unsqueeze(0)  
+        total_bits = 0.0
+        # predict token t from prefix [:t]
+        for t in range(1, seq.size(1)):
+            target = seq[0, t].item()
+            if target == pad_id:
+                break
+            logits = self(seq[:, :t])[:, -1]     
+            log_probs = F.log_softmax(logits, dim=-1)
+            total_bits += float(-log_probs[0, target].item() / LN2)
+        return total_bits
+
+    @torch.no_grad()
+    def posterior_bits(self, dataset, device, pad_id=0, sample_frac=0.1, desc="Posterior compression"):
+        """
+        Mirror the autoreg API: return dict with total/ar/kl bits.
+        For dec-only: KL=0; total=AR.
+        """
+        LN2 = math.log(2)
+        n = max(1, int(sample_frac * len(dataset)))
+        subset = Subset(dataset, range(n))
+        loader = PDataLoader(subset, batch_size=1, shuffle=False)
+
+        records = []
+        for triples, seq in tqdm(loader, desc=desc):
+            seq = seq[0].to(device)
+            ar_bits = self.bits_per_sequence(seq, pad_id=pad_id)
+            kl_bits = 0.0
+            records.append({
+                "ar_bits": ar_bits,
+                "kl_bits": kl_bits,
+                "total_bits": ar_bits, 
+            })
+
+        total = np.array([r["total_bits"] for r in records])
+        ar    = np.array([r["ar_bits"]    for r in records])
+        kl    = np.array([r["kl_bits"]    for r in records])
+        return {
+            "avg_total_bits": float(total.mean()) if len(total) else 0.0,
+            "avg_ar_bits":    float(ar.mean())    if len(ar)    else 0.0,
+            "avg_kl_bits":    float(kl.mean())    if len(kl)    else 0.0,
+            "min_total_bits": float(total.min())  if len(total) else 0.0,
+            "max_total_bits": float(total.max())  if len(total) else 0.0,
+            "records": records,
+        }
+
