@@ -1,14 +1,7 @@
-"""
-Ablation study experiments for Knowledge Graph VAE models.
-
-We will systematically analyze the contribution of different model components
-by removing or modifying them and measuring the impact on performance.
-"""
-
 import torch
-import torch.optim as optim
 import wandb
 import yaml
+import torch.optim as optim
 import argparse
 import os
 import warnings
@@ -84,11 +77,26 @@ def train_epoch(model, dataloader, optimizer, config, device, b=1.0):
     num_batches = 0
     
     model_type = config.get('model_type', 'rescal_vae')
+
     
     for batch_idx, batch_triples in enumerate(tqdm(dataloader, desc="Training")):
         optimizer.zero_grad()
+        
+        if model_type == 'dec_only':
+            triples, seq = batch_triples
+            seq = seq.to(device)
+            logits = model(seq[:, :-1])  # predict next tokens
+            vocab = logits.size(-1)
+            ce = F.cross_entropy(
+                logits.reshape(-1, vocab),
+                seq[:, 1:].reshape(-1),
+                ignore_index=config["special_tokens"]["PAD"]
+            )
+            loss = ce
+            recon_loss = ce
+            kl_loss = torch.tensor(0.0, device=device)
         #autoregressive loss for train
-        if model_type == 'autoreg':
+        elif model_type == 'autoreg':
             triples, seq = batch_triples
             triples = triples.to(device)
             seq = seq.to(device)
@@ -153,11 +161,25 @@ def validate(model, dataloader, config, device, compute_compression=False, b=1.0
     num_batches = 0
     
     model_type = config.get('model_type', 'rescal_vae')
+
     
     with torch.no_grad():
         for batch_triples in tqdm(dataloader, desc="Validation"):
+            if model_type == 'dec_only':
+                triples, seq = batch_triples
+                seq = seq.to(device)
+                logits = model(seq[:, :-1])  # predict next tokens
+                vocab = logits.size(-1)
+                ce = F.cross_entropy(
+                    logits.reshape(-1, vocab),
+                    seq[:, 1:].reshape(-1),
+                    ignore_index=config["special_tokens"]["PAD"]
+                )
+                loss = ce
+                recon_loss = ce
+                kl_loss = torch.tensor(0.0, device=device)
             #autoregressive loss for validation
-            if model_type == 'autoreg':
+            elif model_type == 'autoreg':
                 triples, seq = batch_triples
                 triples = triples.to(device)
                 seq = seq.to(device)
@@ -220,6 +242,24 @@ def validate(model, dataloader, config, device, compute_compression=False, b=1.0
         avg_entity_bits = total_entity_bits / total_graphs if total_graphs > 0 else 0
         return (avg_loss, avg_recon_loss, avg_kl_loss, avg_entity_loss, 
                 avg_compression_bits, avg_kl_bits, avg_edge_bits, avg_entity_bits)
+        
+    elif compute_compression and model_type == 'dec_only':
+        stats = model.posterior_bits(
+            dataloader.dataset,
+            device,
+            pad_id=special_tokens["PAD"],
+            sample_frac=config['sample_frac'],
+            desc="Posterior compression"
+        )
+        print("\n[Final Posterior Compression on Validation/Test Set]")
+        print(f" Final Avg total bits: {stats['avg_total_bits']:.2f}")
+        print(f" Final Avg AR bits:    {stats['avg_ar_bits']:.2f}")
+        avg_compression_bits = stats['avg_total_bits']
+        avg_kl_bits = stats['avg_kl_bits']        
+        avg_entity_bits = stats['avg_ar_bits']   
+        avg_edge_bits = stats['avg_ar_bits']
+        return (avg_loss, avg_recon_loss, avg_kl_loss, avg_entity_loss,
+                avg_compression_bits, avg_kl_bits, avg_edge_bits, avg_entity_bits)
     elif compute_compression and model_type == 'autoreg':
         #posterior compression bits for autoregressive model.
         stats = model.posterior_bits(
@@ -270,17 +310,17 @@ def final_validation(model, test_loader, val_loader, config, device, verifier, i
     
     # Run final evaluation with compression bits for RESCAL-VAE
     model_type = config.get('model_type', 'rescal_vae')
-    compute_final_compression = (model_type == 'rescal_vae' or model_type == 'autoreg')
+    compute_final_compression = model_type in ('rescal_vae', 'autoreg', 'dec_only')
+
     final_results = validate(model, eval_loader, config, device, compute_compression=compute_final_compression, b=b, special_tokens=special_tokens)
     
-    # Unpack results based on model type
-    if model_type == 'rescal_vae' or model_type == 'autoreg' and compute_final_compression:
+    if compute_final_compression:
         (final_loss, final_recon_loss, final_kl_loss, final_entity_loss,
-         final_compression_bits, final_kl_bits, final_edge_bits, final_entity_bits) = final_results
+        final_compression_bits, final_kl_bits, final_edge_bits, final_entity_bits) = final_results
     else:
         final_loss, final_recon_loss, final_kl_loss, final_entity_loss = final_results
         final_compression_bits = final_kl_bits = final_edge_bits = final_entity_bits = None
-    
+
     log_dict = {
         f'final_{eval_set_name}/loss': final_loss,
         f'final_{eval_set_name}/reconstruction_loss': final_recon_loss,
@@ -306,8 +346,31 @@ def final_validation(model, test_loader, val_loader, config, device, verifier, i
     
     # Final verification
     if verifier:
-        
-        if model_type == 'autoreg':
+        if model_type == 'dec_only':
+            with torch.no_grad():
+                N = config.get('num_generated_latent_graphs', 1000)
+                seq_batch = model.generate(
+                seq_len, special_tokens,
+                device=device,
+                batch_size=N,
+                beam=1,
+                sample=True,
+                temperature=config.get('temperature', 1.0),
+                top_p=config.get('top_p', 0.9),   
+                top_k=config.get('top_k', 0)     
+            ) 
+                graphs = [seq_to_triples(row.cpu(), special_tokens, ENT_BASE, REL_BASE) for row in seq_batch]
+                labels = ints_to_labels(graphs, i2e, i2r)
+
+                print("\nExample graphs (decoder-only):")
+                for k in range(min(5, len(labels))):
+                    print(f"[{k}] {labels[k]}")              
+
+
+                run_semantic_evaluation(labels, train_g, i2e, i2r, verifier, title="decoder-only samples")
+
+
+        elif model_type == 'autoreg':
             #generate graphs conditioned on test entities and also from standard normal and evaluate on their validity and novelty
             generated_graphs = model.generate_test_graphs(test_loader, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE,beam_width=config['beam_width'], num_generated_test_graphs=config['num_generated_test_graphs'], device=device) 
             print("\nExample graph (conditioned on test entities):")
@@ -430,14 +493,14 @@ def main():
     seq_len    = 1 + max_edges * 3 + 1
     
     #custom dataset class because of different ordering/shuffling etc 
-    if model_type == 'autoreg':    
+    if model_type in ('autoreg', 'dec_only'):  
         train_loader = PDataLoader(
         GraphSeqDataset(
             graphs=train_g,
             i2e=i2e,
             i2r=i2r,
             triple_order=config["triple_order"],
-            permute=False,
+            permute= config.get("permute_triples", False),
             use_padding=use_padding,
             pad_eid=PAD_EID,
             pad_rid=PAD_RID,
@@ -458,7 +521,7 @@ def main():
                 i2e=i2e,
                 i2r=i2r,
                 triple_order=config['triple_order'],
-                permute=False,
+                permute=config.get("permute_triples", False),
                 use_padding=use_padding,
                 pad_eid=PAD_EID,
                 pad_rid=PAD_RID,
@@ -477,7 +540,7 @@ def main():
                 i2e=i2e,
                 i2r=i2r,
                 triple_order=config['triple_order'],
-                permute=False,
+                permute=config.get("permute_triples", False),
                 use_padding=use_padding,
                 pad_eid=PAD_EID,
                 pad_rid=PAD_RID,
@@ -519,7 +582,22 @@ def main():
             print(f"  Efficient sparse scoring: Only {config['max_edges']} edges per graph")
         print(f"{'='*60}\n")
         model = RESCALVAE(config).to(device)
-    
+   
+    elif model_type == 'dec_only':
+        config.update({
+            "n_entities": num_entities,
+            "n_relations": num_relations,
+            "pad_eid": PAD_EID,
+            "pad_rid": PAD_RID,
+            "seq_len": seq_len,
+            "vocab_size": VOCAB_SIZE,
+            "special_tokens": special_tokens,
+            "ENT_BASE": ENT_BASE,
+            "REL_BASE": REL_BASE
+        })
+        from kgvae.model.models import DecOnlyModel
+        model = DecOnlyModel(config).to(device)
+        
     #autoregressive modeland get the configs to work
     elif model_type == 'autoreg':
         config.update({
@@ -549,8 +627,7 @@ def main():
     if config.get('lr_scheduler', False):
         #the scheduler that works better because of beta annealing
         #if the model is autoregressive, we use CosineAnnealingLR
-        if model_type == 'autoreg':
-        # match the second script
+        if model_type in ('autoreg', 'dec_only'):
             scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
                 T_max=config['num_epochs'],
@@ -585,16 +662,9 @@ def main():
         val_results = validate(model, val_loader, config, device, compute_compression= do_comp,b=b, special_tokens=special_tokens)
         
         # Handle different return values based on model type
-        model_type = config.get('model_type', 'rescal_vae')
-        if model_type == 'rescal_vae' or model_type == 'autoreg':
-            train_loss, train_recon_loss, train_kl_loss, train_entity_loss = train_results
-            val_loss, val_recon_loss, val_kl_loss, val_entity_loss = val_results[:4]
-        else:
-            # For future model types that may not have entity loss
-            train_loss, train_recon_loss, train_kl_loss = train_results
-            val_loss, val_recon_loss, val_kl_loss = val_results[:4]
-            train_entity_loss = 0
-            val_entity_loss = 0
+        train_loss, train_recon_loss, train_kl_loss, train_entity_loss = train_results
+        val_loss,   val_recon_loss,   val_kl_loss,   val_entity_loss   = val_results[:4]
+
         
         if do_comp and len(val_results) == 8:
             _, _, _, _, val_comp_bits, val_kl_bits, val_edge_bits, val_entity_bits = val_results
@@ -611,12 +681,15 @@ def main():
             'epoch': epoch + 1,
             'train/loss': train_loss,
             'train/reconstruction_loss': train_recon_loss,
-            'train/kl_loss': train_kl_loss,
             'val/loss': val_loss,
             'val/reconstruction_loss': val_recon_loss,
-            'val/kl_loss': val_kl_loss,
-            'learning_rate': optimizer.param_groups[0]['lr']
+            'learning_rate': optimizer.param_groups[0]['lr'],
         }
+
+        if model_type in ('autoreg', 'rescal_vae'):
+            log_dict['train/kl_loss'] = train_kl_loss
+            log_dict['val/kl_loss']   = val_kl_loss
+
         
         # Add entity loss for RESCALVAE
         if model_type == 'rescal_vae':
@@ -625,7 +698,30 @@ def main():
         
         # Periodically verify generated graphs
         if verifier and (epoch + 1) % config.get('verify_every', 10) == 0:
-            if model_type == 'autoreg':                
+            if model_type == 'dec_only':
+                with torch.no_grad():
+                    N = config.get('num_generated_latent_graphs', 1000)
+                    seq_batch = model.generate(
+                    seq_len, special_tokens,
+                    device=device,
+                    batch_size=N,
+                    beam=1,
+                    sample=True,
+                    temperature=config.get('temperature', 1.0),
+                    top_p=config.get('top_p', 0.9),   
+                    top_k=config.get('top_k', 0)      
+                ) 
+                    graphs = [seq_to_triples(row.cpu(), special_tokens, ENT_BASE, REL_BASE) for row in seq_batch]
+                    labels = ints_to_labels(graphs, i2e, i2r)
+
+                    print("\nExample graphs (decoder-only):")
+                    for k in range(min(5, len(labels))):
+                        print(f"[{k}] {labels[k]}")
+
+                    run_semantic_evaluation(labels, train_g, i2e, i2r, verifier, title="decoder-only samples")
+
+
+            elif model_type == 'autoreg':                
                 #generate graphs conditioned on test entities and evaluate
                 generated_graphs = model.generate_test_graphs(val_loader, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE,beam_width=config['beam_width'], num_generated_test_graphs=config['num_generated_test_graphs'], device=device) 
                 print("\nExample graph (conditioned on test entities):")
@@ -653,12 +749,16 @@ def main():
         
         wandb.log(log_dict)
         
-        print(f"Train Loss: {train_loss:.4f} (Recon: {train_recon_loss:.4f}, KL: {train_kl_loss:.4f})")
-        print(f"Val Loss: {val_loss:.4f} (Recon: {val_recon_loss:.4f}, KL: {val_kl_loss:.4f})")
-        
+        if model_type in ('autoreg', 'rescal_vae'):
+            print(f"Train Loss: {train_loss:.4f} (Recon: {train_recon_loss:.4f}, KL: {train_kl_loss:.4f})")
+            print(f"Val   Loss: {val_loss:.4f} (Recon: {val_recon_loss:.4f}, KL: {val_kl_loss:.4f})")
+        else:  # dec_only
+            print(f"Train Loss: {train_loss:.4f} (Recon: {train_recon_loss:.4f})")
+            print(f"Val   Loss: {val_loss:.4f} (Recon: {val_recon_loss:.4f})")
+
         if scheduler is not None:
             if config.get('lr_scheduler', False):
-                if model_type == 'autoreg':
+                if model_type == 'autoreg' or model_type == 'dec_only':
                     scheduler.step() 
                 else:
                     scheduler.step(val_loss)
