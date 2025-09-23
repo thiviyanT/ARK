@@ -19,8 +19,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 1. Clone the repository and checkout the feature branch:
 ```bash
 git clone <repository-url>
-cd KGVAE-TMLR
-git checkout feature/kgvae-reimplementation
+cd ARK
 ```
 
 2. Create virtual environment and install dependencies:
