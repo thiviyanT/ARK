@@ -1,6 +1,4 @@
-# KGVAE - Knowledge Graph Variational Autoencoder
-
-A PyTorch implementation of Knowledge Graph Variational Autoencoder.
+# ARK
 
 ## Installation
 
