@@ -1,7 +1,7 @@
 # Configuration for training an autoregressive model on WD articles dataset
 
 # Model architecture
-model_type: autoreg
+model_type: autoreg #can be autoreg or dec_only. The autoreg model uses the variational autoencoder architecture while the dec_only model uses a decoder-only architecture.
 d_model: 512
 d_latent: 128
 n_heads: 8
@@ -19,6 +19,7 @@ dataset: wd-articles
 shuffle_train: false
 use_padding: true
 triple_order: keep #keep for keeping the dataset order as is or alpha_name for sorting categorically 
+permute_triples: true  # whether to permute triples in each graph
 
 # Generation parameters
 num_diversity_samples: 100
@@ -26,7 +27,6 @@ num_generated_test_graphs: 100
 num_generated_latent_graphs: 100
 sample_frac: 0.01
 beam_width: 4
-
 
 # Optimization settings
 lr_scheduler: true
@@ -38,7 +38,6 @@ checkpoint_path: checkpoints/autoreg_wd_articles.pt
 experiment_name: autoreg_vae_wd_articles
 verify_every: 20
 
-
 # Evaluation settings
 use_test_for_final_eval: true  
 
@@ -46,6 +45,6 @@ use_test_for_final_eval: true
 compression_log_every: 20
 
 #ablation study settings
-ablation_encoder: MLP 
-ablation_decoder: GRU
-
+#set to None if no ablation is needed
+# ablation_encoder: MLP 
+ablation_decoder: GRU #this can be used for both the autoreg and dec_only models. In both cases the GRU decoder is used.

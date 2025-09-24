@@ -1,11 +1,12 @@
 # Configuration for training an autoregressive model on synthetic paths dataset
 
 #Model architecture
-model_type: autoreg
-d_model: 512
+model_type: dec_only #can be autoreg or dec_only. The autoreg model uses the variational autoencoder architecture while the dec_only model uses a decoder-only architecture.
+
+d_model: 512  
 d_latent: 10
 n_heads: 4
-n_layers: 3
+n_layers: 2
 
 #Training parameters
 batch_size: 256
@@ -19,11 +20,12 @@ dataset: syn-paths
 shuffle_train: false
 use_padding: false
 triple_order: keep #keep for keeping the dataset order as is or alpha_name for sorting categorically 
+permute_triples: true  # whether to permute triples in each graph
 
 #Generation parameters
 num_diversity_samples: 10000
-num_generated_test_graphs: 1000
-num_generated_latent_graphs: 1000
+num_generated_test_graphs: 10000
+num_generated_latent_graphs: 10000
 sample_frac: 0.1
 beam_width: 4
 
@@ -35,7 +37,7 @@ checkpoint_path: checkpoints/autoreg_syn_paths.pt
 
 #Experiment tracking
 verify_every: 10
-experiment_name: autoreg_vae_syn_paths
+experiment_name: autoreg_vae_syn_paths_dec_only_GRU
 
 #Evaluation settings
 use_test_for_final_eval: true  
@@ -44,6 +46,6 @@ use_test_for_final_eval: true
 compression_log_every: 10
 
 #ablation study settings
-ablation_encoder: MLP 
-ablation_decoder: GRU
-
+#set to None if no ablation is needed
+# ablation_encoder: MLP 
+ablation_decoder: GRU #this can be used for both the autoreg and dec_only models. In both cases the GRU decoder is used.
