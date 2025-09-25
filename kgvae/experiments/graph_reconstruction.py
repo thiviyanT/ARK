@@ -7,6 +7,7 @@ from their latent representations, measuring fidelity and information preservati
 
 
 import argparse
+from email import parser
 import os
 import yaml
 import torch
@@ -290,8 +291,8 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--split", choices=["train", "val", "test"], default="val")
-    parser.add_argument('--wandb-project', type=str, default='submission', help='Weights & Biases project name')
-    parser.add_argument('--wandb-entity', type=str, default='a-vozikis-vrije-universiteit-amsterdam', help='W&B entity')
+    parser.add_argument('--wandb-project', type=str, default='anonymized_project')
+    parser.add_argument('--wandb-entity', type=str, default='anonymous')
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--beam", type=int, default=1)
     parser.add_argument("--max-batches", type=int, default=None)

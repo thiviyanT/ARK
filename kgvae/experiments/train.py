@@ -338,8 +338,8 @@ def final_validation(model, test_loader, val_loader, config, device, verifier, i
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
-    parser.add_argument('--wandb-project', type=str, default='submission', help='Weights & Biases project name')
-    parser.add_argument('--wandb-entity', type=str, default='a-vozikis-vrije-universiteit-amsterdam', help='Weights & Biases entity')
+    parser.add_argument('--wandb-project', type=str, default='anonymized_project')
+    parser.add_argument('--wandb-entity', type=str, default='anonymous')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints', help='Directory to save checkpoints')
     args = parser.parse_args()
     

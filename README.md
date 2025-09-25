@@ -18,7 +18,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
 1. Clone the repository and checkout the feature branch:
 ```bash
-git clone https://github.com/thiviyanT/ARK.git
+git clone -----Anonimized-----
 cd ARK
 ```
 
