@@ -1,7 +1,8 @@
+import math
 import torch
-import torch.optim as optim
 import wandb
 import yaml
+import torch.optim as optim
 import argparse
 import os
 import warnings
@@ -18,54 +19,13 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader as PDataLoader
 
 
-from kgvae.model.rescal_vae_model import RESCALVAE
-from kgvae.model.models import AutoRegModel
-from kgvae.model.utils import (
-    compute_kl_divergence,
-    compute_reconstruction_loss,
-    create_padding_mask,
-    GraphSeqDataset
-)
-from kgvae.model.utils import create_padding_mask
-from kgvae.model.verification import get_verifier, sample_and_verify
+from kgvae.model.models import SAIL, ARK
+from kgvae.model.utils import GraphSeqDataset
+from kgvae.model.verification import get_verifier
 from kgvae.model.utils import  ints_to_labels,  seq_to_triples
 from kgvae.model.verification import run_semantic_evaluation
+from kgvae.model.utils import canonical_graph_string
 
-
-
-def process_batch(batch_triples, max_edges, max_nodes, device):
-    """
-    Process a batch of triples from IntelliGraphs DataLoader.
-    """
-    # batch_triples is already a tensor from IntelliGraphs
-    batch_size = batch_triples.size(0)
-    
-    # Pad/truncate to max_edges
-    current_edges = batch_triples.size(1)
-    
-    if current_edges > max_edges:
-        # Truncate
-        batch_triples = batch_triples[:, :max_edges, :]
-    elif current_edges < max_edges:
-        # Pad with zeros
-        padding = torch.zeros(batch_size, max_edges - current_edges, 3, 
-                             dtype=batch_triples.dtype, device=batch_triples.device)
-        batch_triples = torch.cat([batch_triples, padding], dim=1)
-    
-    # Create mask for padding
-    mask = create_padding_mask(batch_triples)
-    
-    # Extract unique nodes from triples
-    nodes = torch.zeros(batch_size, max_nodes, dtype=torch.long, device=device)
-    for b in range(batch_size):
-        unique_nodes = torch.unique(batch_triples[b, :, [0, 2]].flatten())
-        # Filter out padding (0) and place in nodes tensor
-        unique_nodes = unique_nodes[unique_nodes != 0]
-        num_nodes = min(len(unique_nodes), max_nodes)
-        if num_nodes > 0:
-            nodes[b, :num_nodes] = unique_nodes[:num_nodes]
-    
-    return batch_triples, nodes, mask
 
 
 def train_epoch(model, dataloader, optimizer, config, device, b=1.0): 
@@ -76,12 +36,27 @@ def train_epoch(model, dataloader, optimizer, config, device, b=1.0):
     total_entity_loss = 0
     num_batches = 0
     
-    model_type = config.get('model_type', 'rescal_vae')
+    model_type = config.get('model_type', 'ARK')
+
     
     for batch_idx, batch_triples in enumerate(tqdm(dataloader, desc="Training")):
         optimizer.zero_grad()
+        
+        if model_type == 'ARK' or model_type == 't-ARK':
+            triples, seq = batch_triples
+            seq = seq.to(device)
+            logits = model(seq[:, :-1])  
+            vocab = logits.size(-1)
+            ce = F.cross_entropy(
+                logits.reshape(-1, vocab),
+                seq[:, 1:].reshape(-1),
+                ignore_index=config["special_tokens"]["PAD"]
+            )
+            loss = ce
+            recon_loss = ce
+            kl_loss = torch.tensor(0.0, device=device)
         #autoregressive loss for train
-        if model_type == 'autoreg':
+        elif model_type == 'SAIL' or model_type == 't-SAIL':
             triples, seq = batch_triples
             triples = triples.to(device)
             seq = seq.to(device)
@@ -96,25 +71,7 @@ def train_epoch(model, dataloader, optimizer, config, device, b=1.0):
             loss = ce + b * kl
             recon_loss = ce
             kl_loss = kl
-        else:
-            # Process batch from IntelliGraphs DataLoader
-            triples, nodes, mask = process_batch(batch_triples, config['max_edges'], config['max_nodes'], device)
-            triples = triples.to(device)
-            mask = mask.to(device)
-            
-            if model_type == 'rescal_vae':
-                # RESCALVAE forward pass and loss computation
-                outputs = model(triples, nodes, mask)
-                loss_dict = model.compute_loss(outputs, triples, nodes, mask)
-                loss = loss_dict['loss']
-                recon_loss = loss_dict['edge_loss']
-                kl_loss = loss_dict['kl_loss']
-                entity_loss = loss_dict.get('entity_loss', 0)
-                total_entity_loss += entity_loss.item() if torch.is_tensor(entity_loss) else entity_loss
-            else:
-                raise NotImplementedError(f"Model type '{model_type}' is not implemented")
-        
-        
+                
         loss.backward()
         optimizer.step()
         
@@ -145,12 +102,26 @@ def validate(model, dataloader, config, device, compute_compression=False, b=1.0
     total_graphs = 0
     num_batches = 0
     
-    model_type = config.get('model_type', 'rescal_vae')
+    model_type = config.get('model_type', 'ARK')
+
     
     with torch.no_grad():
         for batch_triples in tqdm(dataloader, desc="Validation"):
+            if model_type == 'ARK' or model_type == 't-ARK':
+                triples, seq = batch_triples
+                seq = seq.to(device)
+                logits = model(seq[:, :-1])  # predict next tokens
+                vocab = logits.size(-1)
+                ce = F.cross_entropy(
+                    logits.reshape(-1, vocab),
+                    seq[:, 1:].reshape(-1),
+                    ignore_index=config["special_tokens"]["PAD"]
+                )
+                loss = ce
+                recon_loss = ce
+                kl_loss = torch.tensor(0.0, device=device)
             #autoregressive loss for validation
-            if model_type == 'autoreg':
+            elif model_type == 'SAIL' or model_type == 't-SAIL':
                 triples, seq = batch_triples
                 triples = triples.to(device)
                 seq = seq.to(device)
@@ -165,37 +136,7 @@ def validate(model, dataloader, config, device, compute_compression=False, b=1.0
                 loss = ce + b * kl
                 recon_loss = ce
                 kl_loss = kl
-            else:
-                # Process batch from IntelliGraphs DataLoader
-                triples, nodes, mask = process_batch(batch_triples, config['max_edges'], config['max_nodes'], device)
-                triples = triples.to(device)
-                mask = mask.to(device)
-
-                if model_type == 'rescal_vae':
-                    # RESCALVAE forward pass and loss computation
-                    outputs = model(triples, nodes, mask)
-                    loss_dict = model.compute_loss(outputs, triples, nodes, mask)
-                    loss = loss_dict['loss']
-                    recon_loss = loss_dict['edge_loss']
-                    kl_loss = loss_dict['kl_loss']
-                    entity_loss = loss_dict.get('entity_loss', 0)
-                    total_entity_loss += entity_loss.item() if torch.is_tensor(entity_loss) else entity_loss
-
-                    # Compute compression bits if requested
-                    if compute_compression:
-                        scoring_mode = config.get('compression_scoring_mode', 'sparse')
-                        compression_dict = model.compute_compression_bits(outputs, triples, nodes, 
-                                                                           scoring_mode=scoring_mode)
-                        total_compression_bits += compression_dict['total_bits']
-                        total_kl_bits += compression_dict['kl_bits']
-                        total_edge_bits += compression_dict['edge_bits']
-                        total_entity_bits += compression_dict['entity_bits']
-                        total_graphs += compression_dict['batch_size']
-                else:
-                    raise NotImplementedError(f"Model type '{model_type}' is not implemented")
-                # Process batch from IntelliGraphs DataLoader
-
-            
+                
             total_loss += loss.item()
             total_recon_loss += recon_loss.item()
             total_kl_loss += kl_loss.item()
@@ -205,15 +146,26 @@ def validate(model, dataloader, config, device, compute_compression=False, b=1.0
     avg_recon_loss = total_recon_loss / num_batches if num_batches > 0 else 0
     avg_kl_loss = total_kl_loss / num_batches if num_batches > 0 else 0
     avg_entity_loss = total_entity_loss / num_batches if num_batches > 0 else 0
-    
-    if compute_compression and model_type == 'rescal_vae':
-        avg_compression_bits = total_compression_bits / total_graphs if total_graphs > 0 else 0
-        avg_kl_bits = total_kl_bits / total_graphs if total_graphs > 0 else 0
-        avg_edge_bits = total_edge_bits / total_graphs if total_graphs > 0 else 0
-        avg_entity_bits = total_entity_bits / total_graphs if total_graphs > 0 else 0
-        return (avg_loss, avg_recon_loss, avg_kl_loss, avg_entity_loss, 
+
+
+    if compute_compression and (model_type == 'ARK' or model_type == 't-ARK'):
+        stats = model.posterior_bits(
+            dataloader.dataset,
+            device,
+            pad_id=special_tokens["PAD"],
+            sample_frac=config['sample_frac'],
+            desc="Posterior compression"
+        )
+        print("\n[Final Posterior Compression on Validation/Test Set]")
+        print(f" Final Avg total bits: {stats['avg_total_bits']:.2f}")
+        print(f" Final Avg AR bits:    {stats['avg_ar_bits']:.2f}")
+        avg_compression_bits = stats['avg_total_bits']
+        avg_kl_bits = stats['avg_kl_bits']        
+        avg_entity_bits = stats['avg_ar_bits']   
+        avg_edge_bits = stats['avg_ar_bits']
+        return (avg_loss, avg_recon_loss, avg_kl_loss, avg_entity_loss,
                 avg_compression_bits, avg_kl_bits, avg_edge_bits, avg_entity_bits)
-    elif compute_compression and model_type == 'autoreg':
+    elif compute_compression and (model_type == 'SAIL' or model_type == 't-SAIL'):
         #posterior compression bits for autoregressive model.
         stats = model.posterior_bits(
             dataloader.dataset,
@@ -261,19 +213,19 @@ def final_validation(model, test_loader, val_loader, config, device, verifier, i
     if use_test:
         warnings.warn("Using TEST SET for final evaluation", UserWarning)
     
-    # Run final evaluation with compression bits for RESCAL-VAE
-    model_type = config.get('model_type', 'rescal_vae')
-    compute_final_compression = (model_type == 'rescal_vae' or model_type == 'autoreg')
+    # Run final evaluation with compression bits
+    model_type = config.get('model_type', 'ARK')
+    compute_final_compression = model_type in ('ARK', 't-ARK', 'SAIL', 't-SAIL')
+
     final_results = validate(model, eval_loader, config, device, compute_compression=compute_final_compression, b=b, special_tokens=special_tokens)
     
-    # Unpack results based on model type
-    if model_type == 'rescal_vae' or model_type == 'autoreg' and compute_final_compression:
+    if compute_final_compression:
         (final_loss, final_recon_loss, final_kl_loss, final_entity_loss,
-         final_compression_bits, final_kl_bits, final_edge_bits, final_entity_bits) = final_results
+        final_compression_bits, final_kl_bits, final_edge_bits, final_entity_bits) = final_results
     else:
         final_loss, final_recon_loss, final_kl_loss, final_entity_loss = final_results
         final_compression_bits = final_kl_bits = final_edge_bits = final_entity_bits = None
-    
+
     log_dict = {
         f'final_{eval_set_name}/loss': final_loss,
         f'final_{eval_set_name}/reconstruction_loss': final_recon_loss,
@@ -299,61 +251,166 @@ def final_validation(model, test_loader, val_loader, config, device, verifier, i
     
     # Final verification
     if verifier:
-        
-        if model_type == 'autoreg':
+        if model_type == 'ARK' or model_type == 't-ARK':                
+            target_N = config.get('num_generated_latent_graphs', 1000)
+            chunk_size = 50
+            all_batches = []
+
+            while sum(x.size(0) for x in all_batches) < target_N:
+                with torch.inference_mode():
+                    seq_batch = model.generate(
+                        seq_len, special_tokens,
+                        device=device,
+                        batch_size=chunk_size,
+                        beam=1,
+                        sample=True,
+                        temperature=config.get('temperature', 1.0),
+                        top_p=config.get('top_p', 0.9),
+                        top_k=config.get('top_k', 0)
+                    ).cpu()
+                all_batches.append(seq_batch)
+
+            seq_batch = torch.cat(all_batches, dim=0)[:target_N]
+
+            graphs = [seq_to_triples(row.cpu(), special_tokens, ENT_BASE, REL_BASE) for row in seq_batch]
+            labels = ints_to_labels(graphs, i2e, i2r)
+
+            print("\nExample graphs (ARK):")
+            for k in range(min(5, len(labels))):
+                print(f"[{k}] {labels[k]}")              
+
+            sem_eval = run_semantic_evaluation(labels, train_g, i2e, i2r, verifier, title="ARK samples")
+            res = sem_eval.organized_results["results"]
+
+            # Also include in the final metrics dict returned by final_validation
+            log_dict.update({
+                f'final_{eval_set_name}/validity_rate':      res.get("semantics", 0.0) / 100.0,
+                f'final_{eval_set_name}/novelty_rate':       res.get("novel", 0.0) / 100.0,
+                f'final_{eval_set_name}/valid_novelty_rate': res.get("novel_semantics", 0.0) / 100.0,
+            })
+
+            print(f"Final {eval_set_name} — validity: {res.get('semantics',0.0):.2f}% | "
+                f"novelty: {res.get('novel',0.0):.2f}% | "
+                f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
+
+
+        elif model_type == 'SAIL' or model_type == 't-SAIL':
             #generate graphs conditioned on test entities and also from standard normal and evaluate on their validity and novelty
-            generated_graphs = model.generate_test_graphs(test_loader, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE,beam_width=config['beam_width'], num_generated_test_graphs=config['num_generated_test_graphs'], device=device) 
-            print("\nExample graph (conditioned on test entities):")
-            print(ints_to_labels(generated_graphs,i2e,i2r)[0])
-            run_semantic_evaluation(ints_to_labels(generated_graphs, i2e, i2r),train_g, i2e, i2r, verifier, title="graphs conditioned on test entities")
-            z_rand = torch.randn(config['num_generated_latent_graphs'], config['d_latent'], device=device)
-            latent_graphs = model.decode_latent(z_rand, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE, beam=1)
+            # generated_graphs = model.generate_test_graphs(test_loader, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE,beam_width=config['beam_width'], num_generated_test_graphs=config['num_generated_test_graphs'], device=device) 
+            # print("\nExample graph (conditioned on test entities):")
+            # print(ints_to_labels(generated_graphs,i2e,i2r)[0])
+            # sem_eval = run_semantic_evaluation(ints_to_labels(generated_graphs, i2e, i2r),train_g, i2e, i2r, verifier, title="graphs conditioned on test entities")
+            # res = sem_eval.organized_results["results"]
+
+            # # Also include in the final metrics dict returned by final_validation
+            # log_dict.update({
+            #     f'final_{eval_set_name}/cond_validity_rate':      res.get("semantics", 0.0) / 100.0,
+            #     f'final_{eval_set_name}/cond_novelty_rate':       res.get("novel", 0.0) / 100.0,
+            #     f'final_{eval_set_name}/cond_valid_novelty_rate': res.get("novel_semantics", 0.0) / 100.0,
+            # })
+
+            # print(f"Final {eval_set_name} — validity: {res.get('semantics',0.0):.2f}% | "
+            #     f"novelty: {res.get('novel',0.0):.2f}% | "
+            #     f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
+            
+            # z_rand = torch.randn(config['num_generated_latent_graphs'], config['d_latent'], device=device)
+            # latent_graphs = model.decode_latent(z_rand, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE, beam=1)
+            # print("\nExample graph (random latent):")
+            # print(ints_to_labels(latent_graphs, i2e, i2r)[0])
+            # run_semantic_evaluation(ints_to_labels(latent_graphs, i2e, i2r), train_g, i2e, i2r, verifier, title="graphs from random latent")
+            
+            target_N   = config.get('num_generated_latent_graphs', 10000)
+            chunk_size = 50
+            d_latent   = config['d_latent']
+
+            latent_graphs = []
+            left = target_N
+            with torch.inference_mode():
+                while left > 0:
+                    bs = min(chunk_size, left)
+                    z  = torch.randn(bs, d_latent, device=device)
+                    g_chunk = model.decode_latent(
+                        z, seq_len, special_tokens, seq_to_triples,
+                        ENT_BASE, REL_BASE, beam=1
+                    )
+                    latent_graphs.extend(g_chunk)
+                    left -= bs
+
             print("\nExample graph (random latent):")
             print(ints_to_labels(latent_graphs, i2e, i2r)[0])
-            run_semantic_evaluation(ints_to_labels(latent_graphs, i2e, i2r), train_g, i2e, i2r, verifier, title="graphs from random latent")
-            decode_fn = lambda z, beam=1: model.decode_latent(z, seq_len, special_tokens,seq_to_triples, ENT_BASE, REL_BASE, beam=beam)
-            div = model.count_unique_graphs(config['d_latent'], decode_fn, num_samples=config['num_diversity_samples'], beam=1)
-            wandb.log({"diversity/unique_graphs": len(div),
-                "diversity/ratio": len(div) / (100 if config['dataset']=="wd-articles" else 10000)}) 
 
-        
-        else:
-            final_verification = sample_and_verify(
-                model, config, verifier, i2e, i2r, device,
-                num_samples=config.get('verify_samples', 100)
+            # Run semantic eval ONCE for random-latent graphs
+            sem_eval = run_semantic_evaluation(
+                ints_to_labels(latent_graphs, i2e, i2r),
+                train_g, i2e, i2r, verifier,
+                title="graphs from random latent"
             )
-            print(f"Final generation validity: {final_verification['validity_rate']:.2%} "
-                f"({final_verification['valid_count']}/{final_verification['total_count']})")
-            
+            res = sem_eval.organized_results["results"]
+
+            # Also include in the final metrics dict returned by final_validation
             log_dict.update({
-                f'final_{eval_set_name}/validity_rate': final_verification['validity_rate'],
-                f'final_{eval_set_name}/valid_count': final_verification['valid_count'],
-                f'final_{eval_set_name}/total_count': final_verification['total_count']
+                f'final_{eval_set_name}/latent_validity_rate':      res.get("semantics", 0.0) / 100.0,
+                f'final_{eval_set_name}/latent_novelty_rate':       res.get("novel", 0.0) / 100.0,
+                f'final_{eval_set_name}/latent_valid_novelty_rate': res.get("novel_semantics", 0.0) / 100.0,
             })
-    
+
+            print(f"Final {eval_set_name} — validity: {res.get('semantics',0.0):.2f}% | "
+                f"novelty: {res.get('novel',0.0):.2f}% | "
+                f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
+            
+            # decode_fn = lambda z, beam=1: model.decode_latent(z, seq_len, special_tokens,seq_to_triples, ENT_BASE, REL_BASE, beam=beam)
+            # div = model.count_unique_graphs(config['d_latent'], decode_fn, num_samples=config['num_diversity_samples'], beam=1)
+            # wandb.log({"diversity/unique_graphs": len(div),
+            #     "diversity/ratio": len(div) / (100 if config['dataset']=="wd-articles" else 10000)}) 
+            uniq = {canonical_graph_string(g) for g in latent_graphs}
+            wandb.log({
+                "diversity/unique_graphs": len(uniq),
+                "diversity/ratio": len(uniq) / len(latent_graphs)
+            })
+
+            
     print("="*50)
     return log_dict
-
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
-    parser.add_argument('--wandb-project', type=str, default='anonymized_project')
-    parser.add_argument('--wandb-entity', type=str, default='anonymous')
+    parser.add_argument('--wandb-project', type=str, default='submission', help='Weights & Biases project name')
+    parser.add_argument('--wandb-entity', type=str, default='a-vozikis-vrije-universiteit-amsterdam', help='Weights & Biases entity')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints', help='Directory to save checkpoints')
     args = parser.parse_args()
     
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
         
-    model_type = config.get('model_type', 'kgvae')
+    def apply_overrides(cfg, overrides):
+        for k, v in dict(overrides).items():
+            cfg[k] = v
+        return cfg
+        
+    model_type = config.get('model_type', 'ARK')
     
     wandb.init(
         project=args.wandb_project,
         entity=args.wandb_entity,
         config=config,
-        name=config.get('experiment_name', 'rescal_vae_experiment')
+        name=config.get('experiment_name', 'ARK_experiment')
     )
+    
+    config = apply_overrides(config, wandb.config)
+    config['learning_rate'] = float(config.get('learning_rate', 1e-3))
+    run_dir = os.path.join(args.checkpoint_dir, wandb.run.id)
+    os.makedirs(run_dir, exist_ok=True)
+    args.checkpoint_dir = run_dir
+
+    # (nice to have) save effective config for reproducibility
+    with open(os.path.join(run_dir, "effective_config.yaml"), "w") as f:
+        yaml.safe_dump(config, f)
+
+    # --- NEW: init objective tracking for the sweep ---
+    best_comp_bits = 1e12
+    wandb.log({'objective': best_comp_bits})
+
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -398,9 +455,10 @@ def main():
     i2r = {idx: relation for relation, idx in relation_map.items()}
     
     #autoreg model specific configurations
-    (train_g, val_g, test_g,(e2i, _),(r2i, _),(min_edges, max_edges), _) = load_data_as_list(dataset_name)
-    if model_type == 'autoreg':
-        (train_g, val_g, test_g,(e2i, i2e),(r2i, i2r),(min_edges, max_edges), _) = load_data_as_list(dataset_name)
+    # (train_g, val_g, test_g,(e2i, _),(r2i, _),(min_edges, max_edges), _) = load_data_as_list(dataset_name)
+    # if model_type == 'autoreg':
+    #     (train_g, val_g, test_g,(e2i, i2e),(r2i, i2r),(min_edges, max_edges), _) = load_data_as_list(dataset_name)
+    (train_g, val_g, test_g,(e2i, i2e),(r2i, i2r),(min_edges, max_edges), _) = load_data_as_list(dataset_name)
 
     num_entities  = len(e2i)
     num_relations = len(r2i)
@@ -423,14 +481,14 @@ def main():
     seq_len    = 1 + max_edges * 3 + 1
     
     #custom dataset class because of different ordering/shuffling etc 
-    if model_type == 'autoreg':    
+    if model_type in ('ARK', 't-ARK', 'SAIL', 't-SAIL'):
         train_loader = PDataLoader(
         GraphSeqDataset(
             graphs=train_g,
             i2e=i2e,
             i2r=i2r,
             triple_order=config["triple_order"],
-            permute=False,
+            permute= config.get("permute_triples", False),
             use_padding=use_padding,
             pad_eid=PAD_EID,
             pad_rid=PAD_RID,
@@ -451,7 +509,7 @@ def main():
                 i2e=i2e,
                 i2r=i2r,
                 triple_order=config['triple_order'],
-                permute=False,
+                permute=config.get("permute_triples", False),
                 use_padding=use_padding,
                 pad_eid=PAD_EID,
                 pad_rid=PAD_RID,
@@ -470,7 +528,7 @@ def main():
                 i2e=i2e,
                 i2r=i2r,
                 triple_order=config['triple_order'],
-                permute=False,
+                permute=config.get("permute_triples", False),
                 use_padding=use_padding,
                 pad_eid=PAD_EID,
                 pad_rid=PAD_RID,
@@ -497,24 +555,25 @@ def main():
         print(f"Warning: No verifier available for dataset {dataset_name}")
     
     # Initialize model based on config
-    model_type = config.get('model_type', 'rescal_vae')
+    model_type = config.get('model_type', 'ARK')
     
-    if model_type == 'rescal_vae':
-        scoring_mode = config.get('compression_scoring_mode', 'sparse')
-        print(f"\n{'='*60}")
-        print(f"RESCAL-VAE Configuration:")
-        print(f"  Training/Evaluation scoring mode: {scoring_mode.upper()}")
-        print(f"  Compression logging every: {config.get('compression_log_every', 5)} epochs")
-        if scoring_mode == 'dense':
-            print(f"  WARNING: Dense scoring is memory intensive!")
-            print(f"  Total edges to score per graph: {config['max_nodes']}×{config['max_nodes']}×{config['n_relations']} = {config['max_nodes']*config['max_nodes']*config['n_relations']}")
-        else:
-            print(f"  Efficient sparse scoring: Only {config['max_edges']} edges per graph")
-        print(f"{'='*60}\n")
-        model = RESCALVAE(config).to(device)
-    
+   
+    if model_type == 'ARK' or model_type == 't-ARK':
+        config.update({
+            "n_entities": num_entities,
+            "n_relations": num_relations,
+            "pad_eid": PAD_EID,
+            "pad_rid": PAD_RID,
+            "seq_len": seq_len,
+            "vocab_size": VOCAB_SIZE,
+            "special_tokens": special_tokens,
+            "ENT_BASE": ENT_BASE,
+            "REL_BASE": REL_BASE
+        })
+        model = ARK(config).to(device)
+        
     #autoregressive modeland get the configs to work
-    elif model_type == 'autoreg':
+    elif model_type == 'SAIL' or model_type == 't-SAIL':
         config.update({
     "n_entities": num_entities,
     "n_relations": num_relations,
@@ -525,16 +584,19 @@ def main():
     "special_tokens": special_tokens,
     "ENT_BASE": ENT_BASE,
     "REL_BASE": REL_BASE})
-        model = AutoRegModel(config).to(device)
+        model = SAIL(config).to(device)
     else:
-        raise NotImplementedError(f"Model type '{model_type}' is not implemented. Only 'rescal_vae' is currently supported.")
+        raise NotImplementedError(
+            f"Model type '{model_type}' is not implemented. Use one of: 'ARK','t-ARK','SAIL','t-SAIL'."
+        )
+
     
     print(f"Using model: {model_type}")
     
     # Support multi-GPU training if available
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs for training")
-        model = torch.nn.DataParallel(model)
+    # if torch.cuda.device_count() > 1:
+    #     print(f"Using {torch.cuda.device_count()} GPUs for training")
+    #     model = torch.nn.DataParallel(model)
     
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     
@@ -542,19 +604,11 @@ def main():
     if config.get('lr_scheduler', False):
         #the scheduler that works better because of beta annealing
         #if the model is autoregressive, we use CosineAnnealingLR
-        if model_type == 'autoreg':
-        # match the second script
+        if model_type in ('ARK', 't-ARK', 'SAIL', 't-SAIL'):
             scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
                 T_max=config['num_epochs'],
                 eta_min=config.get('eta_min', 1e-6)
-            )
-        else:
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode='min',
-                factor=0.5,
-                patience=5
             )
     
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -564,13 +618,10 @@ def main():
     for epoch in range(config['num_epochs']):
         print(f"\nEpoch {epoch + 1}/{config['num_epochs']}")
         b = 1
-        if model_type == 'autoreg':
+        if model_type == 'SAIL' or model_type == 't-SAIL':
             b = config['beta0'] + (config['beta1'] - config['beta0']) * epoch / config['num_epochs']
-        elif model_type == 'rescal_vae':
-            b = config["beta"]
 
         train_results = train_epoch(model, train_loader, optimizer, config, device,b)
-        
         
         comp_every = int(config.get('compression_log_every', 5))
         do_comp   = ((epoch + 1) % comp_every == 0)
@@ -578,16 +629,9 @@ def main():
         val_results = validate(model, val_loader, config, device, compute_compression= do_comp,b=b, special_tokens=special_tokens)
         
         # Handle different return values based on model type
-        model_type = config.get('model_type', 'rescal_vae')
-        if model_type == 'rescal_vae' or model_type == 'autoreg':
-            train_loss, train_recon_loss, train_kl_loss, train_entity_loss = train_results
-            val_loss, val_recon_loss, val_kl_loss, val_entity_loss = val_results[:4]
-        else:
-            # For future model types that may not have entity loss
-            train_loss, train_recon_loss, train_kl_loss = train_results
-            val_loss, val_recon_loss, val_kl_loss = val_results[:4]
-            train_entity_loss = 0
-            val_entity_loss = 0
+        train_loss, train_recon_loss, train_kl_loss, train_entity_loss = train_results
+        val_loss,   val_recon_loss,   val_kl_loss,   val_entity_loss   = val_results[:4]
+
         
         if do_comp and len(val_results) == 8:
             _, _, _, _, val_comp_bits, val_kl_bits, val_edge_bits, val_entity_bits = val_results
@@ -597,6 +641,14 @@ def main():
             'val/compression_edge_bits': val_edge_bits,
             'val/compression_entity_bits': val_entity_bits,
         })
+            
+            vcb = float(val_comp_bits)
+            if math.isfinite(vcb) and vcb < best_comp_bits:
+                best_comp_bits = vcb
+            wandb.log({'objective': best_comp_bits})
+        else:
+            wandb.log({'objective': best_comp_bits})
+
 
         
         # Log basic metrics
@@ -604,62 +656,141 @@ def main():
             'epoch': epoch + 1,
             'train/loss': train_loss,
             'train/reconstruction_loss': train_recon_loss,
-            'train/kl_loss': train_kl_loss,
             'val/loss': val_loss,
             'val/reconstruction_loss': val_recon_loss,
-            'val/kl_loss': val_kl_loss,
-            'learning_rate': optimizer.param_groups[0]['lr']
+            'learning_rate': optimizer.param_groups[0]['lr'],
         }
-        
-        # Add entity loss for RESCALVAE
-        if model_type == 'rescal_vae':
-            log_dict['train/entity_loss'] = train_entity_loss
-            log_dict['val/entity_loss'] = val_entity_loss
+
+        if model_type in ('SAIL', 't-SAIL'):
+            log_dict['train/kl_loss'] = train_kl_loss
+            log_dict['val/kl_loss']   = val_kl_loss
+
         
         # Periodically verify generated graphs
         if verifier and (epoch + 1) % config.get('verify_every', 10) == 0:
-            if model_type == 'autoreg':                
+            if model_type == 'ARK' or model_type == 't-ARK':
+                target_N = config.get('num_generated_latent_graphs', 1000)
+                chunk_size = 50
+                all_batches = []
+
+                while sum(x.size(0) for x in all_batches) < target_N:
+                    with torch.inference_mode():
+                        seq_batch = model.generate(
+                            seq_len, special_tokens,
+                            device=device,
+                            batch_size=chunk_size,
+                            beam=1,
+                            sample=True,
+                            temperature=config.get('temperature', 1.0),
+                            top_p=config.get('top_p', 0.9),
+                            top_k=config.get('top_k', 0)
+                        ).cpu()
+                    all_batches.append(seq_batch)
+
+                seq_batch = torch.cat(all_batches, dim=0)[:target_N]
+
+                graphs = [seq_to_triples(row.cpu(), special_tokens, ENT_BASE, REL_BASE) for row in seq_batch]
+                labels = ints_to_labels(graphs, i2e, i2r)
+
+                print("\nExample graphs (decoder-only):")
+                for k in range(min(5, len(labels))):
+                    print(f"[{k}] {labels[k]}")
+
+                sem_eval = run_semantic_evaluation(labels, train_g, i2e, i2r, verifier, title="decoder-only samples")
+                res = sem_eval.organized_results["results"]
+
+                wandb.log({
+                    "verification/validity_rate":       res.get("semantics", 0.0) / 100.0,
+                    "verification/novelty_rate":        res.get("novel", 0.0) / 100.0,
+                    "verification/valid_novelty_rate":  res.get("novel_semantics", 0.0) / 100.0,
+                })
+
+                print(f"Verification — validity: {res.get('semantics',0.0):.2f}% | "
+                    f"novelty: {res.get('novel',0.0):.2f}% | "
+                    f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
+
+
+            elif model_type == 'SAIL' or model_type == 't-SAIL':
                 #generate graphs conditioned on test entities and evaluate
-                generated_graphs = model.generate_test_graphs(val_loader, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE,beam_width=config['beam_width'], num_generated_test_graphs=config['num_generated_test_graphs'], device=device) 
-                print("\nExample graph (conditioned on test entities):")
-                print(ints_to_labels(generated_graphs,i2e,i2r)[0])
-                run_semantic_evaluation(ints_to_labels(generated_graphs, i2e, i2r),train_g, i2e, i2r, verifier, title="graphs conditioned on test entities")
+                # generated_graphs = model.generate_test_graphs(val_loader, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE,beam_width=config['beam_width'], num_generated_test_graphs=config['num_generated_test_graphs'], device=device) 
+                # print("\nExample graph (conditioned on test entities):")
+                # print(ints_to_labels(generated_graphs,i2e,i2r)[0])
+                # sem_eval = run_semantic_evaluation(ints_to_labels(generated_graphs, i2e, i2r),train_g, i2e, i2r, verifier, title="graphs conditioned on test entities")
+                # res = sem_eval.organized_results["results"]
+
+                # wandb.log({
+                #     "verification/cond_validity_rate":       res.get("semantics", 0.0) / 100.0,
+                #     "verification/cond_novelty_rate":        res.get("novel", 0.0) / 100.0,
+                #     "verification/cond_valid_novelty_rate":  res.get("novel_semantics", 0.0) / 100.0,
+                # })
+
+                # print(f"Verification — validity: {res.get('semantics',0.0):.2f}% | "
+                #     f"novelty: {res.get('novel',0.0):.2f}% | "
+                #     f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
+                
+                
                 #generate graphs from standard normal and evaluate
-                z_rand = torch.randn(config['num_generated_latent_graphs'], config['d_latent'], device=device)
-                latent_graphs = model.decode_latent(z_rand, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE, beam=1)
+                # z_rand = torch.randn(config['num_generated_latent_graphs'], config['d_latent'], device=device)
+                # latent_graphs = model.decode_latent(z_rand, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE, beam=1)
+                # print("\nExample graph (random latent):")
+                # print(ints_to_labels(latent_graphs, i2e, i2r)[0])
+                # run_semantic_evaluation(ints_to_labels(latent_graphs, i2e, i2r), train_g, i2e, i2r, verifier, title="graphs from random latent")
+                target_N   = config.get('num_generated_latent_graphs', 10000)
+                chunk_size = 50
+                d_latent   = config['d_latent']
+
+                latent_graphs = []
+                left = target_N
+                with torch.inference_mode():
+                    while left > 0:
+                        bs = min(chunk_size, left)
+                        z  = torch.randn(bs, d_latent, device=device)
+                        g_chunk = model.decode_latent(
+                            z, seq_len, special_tokens, seq_to_triples,
+                            ENT_BASE, REL_BASE, beam=1
+                        )
+                        latent_graphs.extend(g_chunk)
+                        left -= bs
+
                 print("\nExample graph (random latent):")
                 print(ints_to_labels(latent_graphs, i2e, i2r)[0])
-                run_semantic_evaluation(ints_to_labels(latent_graphs, i2e, i2r), train_g, i2e, i2r, verifier, title="graphs from random latent")
 
-            else:
-                verification_results = sample_and_verify(
-                    model, config, verifier, i2e, i2r, device, 
-                    num_samples=config.get('verify_samples', 100)
+                # Run semantic eval ONCE for random-latent graphs
+                sem_eval = run_semantic_evaluation(
+                    ints_to_labels(latent_graphs, i2e, i2r),
+                    train_g, i2e, i2r, verifier,
+                    title="graphs from random latent"
                 )
-                log_dict.update({
-                    'verification/validity_rate': verification_results['validity_rate'],
-                    'verification/valid_count': verification_results['valid_count'],
-                    'verification/total_count': verification_results['total_count']
+                res = sem_eval.organized_results["results"]
+
+                wandb.log({
+                    "verification/latent_validity_rate":       res.get("semantics", 0.0) / 100.0,
+                    "verification/latent_novelty_rate":        res.get("novel", 0.0) / 100.0,
+                    "verification/latent_valid_novelty_rate":  res.get("novel_semantics", 0.0) / 100.0,
                 })
-                print(f"Graph Verification: {verification_results['valid_count']}/{verification_results['total_count']} "
-                    f"valid ({verification_results['validity_rate']:.2%})")
+
+                print(f"Verification — validity: {res.get('semantics',0.0):.2f}% | "
+                    f"novelty: {res.get('novel',0.0):.2f}% | "
+                    f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
         
         wandb.log(log_dict)
         
-        print(f"Train Loss: {train_loss:.4f} (Recon: {train_recon_loss:.4f}, KL: {train_kl_loss:.4f})")
-        print(f"Val Loss: {val_loss:.4f} (Recon: {val_recon_loss:.4f}, KL: {val_kl_loss:.4f})")
-        
+        if model_type in ('SAIL', 't-SAIL'):
+            print(f"Train Loss: {train_loss:.4f} (Recon: {train_recon_loss:.4f}, KL: {train_kl_loss:.4f})")
+            print(f"Val   Loss: {val_loss:.4f} (Recon: {val_recon_loss:.4f}, KL: {val_kl_loss:.4f})")
+        else:  # dec_only
+            print(f"Train Loss: {train_loss:.4f} (Recon: {train_recon_loss:.4f})")
+            print(f"Val   Loss: {val_loss:.4f} (Recon: {val_recon_loss:.4f})")
+
         if scheduler is not None:
             if config.get('lr_scheduler', False):
-                if model_type == 'autoreg':
-                    scheduler.step() 
-                else:
-                    scheduler.step(val_loss)
+                scheduler.step() 
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             # Handle DataParallel when saving
-            model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()            
+            # model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict() 
+            model_state = model.state_dict()            
             vocabs = {
         'e2i': e2i, 'i2e': i2e,
         'r2i': r2i, 'i2r': i2r,
@@ -689,7 +820,8 @@ def main():
         
         if (epoch + 1) % config.get('save_every', 10) == 0:
             # Handle DataParallel when saving
-            model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+            # model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+            model_state = model.state_dict()
             vocabs = {
         'e2i': e2i, 'i2e': i2e,
         'r2i': r2i, 'i2r': i2r,
