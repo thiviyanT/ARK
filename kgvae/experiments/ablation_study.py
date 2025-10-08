@@ -110,7 +110,7 @@ def validate(model, dataloader, config, device, compute_compression=False, b=1.0
             if model_type == 'ARK' or model_type == 't-ARK':
                 triples, seq = batch_triples
                 seq = seq.to(device)
-                logits = model(seq[:, :-1])  # predict next tokens
+                logits = model(seq[:, :-1]) 
                 vocab = logits.size(-1)
                 ce = F.cross_entropy(
                     logits.reshape(-1, vocab),
@@ -295,29 +295,6 @@ def final_validation(model, test_loader, val_loader, config, device, verifier, i
 
 
         elif model_type == 'SAIL' or model_type == 't-SAIL':
-            #generate graphs conditioned on test entities and also from standard normal and evaluate on their validity and novelty
-            # generated_graphs = model.generate_test_graphs(test_loader, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE,beam_width=config['beam_width'], num_generated_test_graphs=config['num_generated_test_graphs'], device=device) 
-            # print("\nExample graph (conditioned on test entities):")
-            # print(ints_to_labels(generated_graphs,i2e,i2r)[0])
-            # sem_eval = run_semantic_evaluation(ints_to_labels(generated_graphs, i2e, i2r),train_g, i2e, i2r, verifier, title="graphs conditioned on test entities")
-            # res = sem_eval.organized_results["results"]
-
-            # # Also include in the final metrics dict returned by final_validation
-            # log_dict.update({
-            #     f'final_{eval_set_name}/cond_validity_rate':      res.get("semantics", 0.0) / 100.0,
-            #     f'final_{eval_set_name}/cond_novelty_rate':       res.get("novel", 0.0) / 100.0,
-            #     f'final_{eval_set_name}/cond_valid_novelty_rate': res.get("novel_semantics", 0.0) / 100.0,
-            # })
-
-            # print(f"Final {eval_set_name} — validity: {res.get('semantics',0.0):.2f}% | "
-            #     f"novelty: {res.get('novel',0.0):.2f}% | "
-            #     f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
-            
-            # z_rand = torch.randn(config['num_generated_latent_graphs'], config['d_latent'], device=device)
-            # latent_graphs = model.decode_latent(z_rand, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE, beam=1)
-            # print("\nExample graph (random latent):")
-            # print(ints_to_labels(latent_graphs, i2e, i2r)[0])
-            # run_semantic_evaluation(ints_to_labels(latent_graphs, i2e, i2r), train_g, i2e, i2r, verifier, title="graphs from random latent")
             
             target_N   = config.get('num_generated_latent_graphs', 10000)
             chunk_size = 50
@@ -358,10 +335,6 @@ def final_validation(model, test_loader, val_loader, config, device, verifier, i
                 f"novelty: {res.get('novel',0.0):.2f}% | "
                 f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
             
-            # decode_fn = lambda z, beam=1: model.decode_latent(z, seq_len, special_tokens,seq_to_triples, ENT_BASE, REL_BASE, beam=beam)
-            # div = model.count_unique_graphs(config['d_latent'], decode_fn, num_samples=config['num_diversity_samples'], beam=1)
-            # wandb.log({"diversity/unique_graphs": len(div),
-            #     "diversity/ratio": len(div) / (100 if config['dataset']=="wd-articles" else 10000)}) 
             uniq = {canonical_graph_string(g) for g in latent_graphs}
             wandb.log({
                 "diversity/unique_graphs": len(uniq),
@@ -409,11 +382,9 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
     args.checkpoint_dir = run_dir
 
-    # (nice to have) save effective config for reproducibility
     with open(os.path.join(run_dir, "effective_config.yaml"), "w") as f:
         yaml.safe_dump(config, f)
 
-    # --- NEW: init objective tracking for the sweep ---
     best_comp_bits = 1e12
     wandb.log({'objective': best_comp_bits})
 
@@ -460,10 +431,6 @@ def main():
     i2e = {idx: entity for entity, idx in entity_map.items()}
     i2r = {idx: relation for relation, idx in relation_map.items()}
     
-    #autoreg model specific configurations
-    # (train_g, val_g, test_g,(e2i, _),(r2i, _),(min_edges, max_edges), _) = load_data_as_list(dataset_name)
-    # if model_type == 'autoreg':
-    #     (train_g, val_g, test_g,(e2i, i2e),(r2i, i2r),(min_edges, max_edges), _) = load_data_as_list(dataset_name)
     (train_g, val_g, test_g,(e2i, i2e),(r2i, i2r),(min_edges, max_edges), _) = load_data_as_list(dataset_name)
 
     num_entities  = len(e2i)
@@ -599,17 +566,13 @@ def main():
     
     print(f"Using model: {model_type}")
     
-    # Support multi-GPU training if available
-    # if torch.cuda.device_count() > 1:
-    #     print(f"Using {torch.cuda.device_count()} GPUs for training")
-    #     model = torch.nn.DataParallel(model)
+
     
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     
     scheduler = None
     if config.get('lr_scheduler', False):
-        #the scheduler that works better because of beta annealing
-        #if the model is autoregressive, we use CosineAnnealingLR
+
         if model_type in ('ARK', 't-ARK', 'SAIL', 't-SAIL'):
             scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
@@ -717,30 +680,7 @@ def main():
 
 
             elif model_type == 'SAIL' or model_type == 't-SAIL':
-                #generate graphs conditioned on test entities and evaluate
-                # generated_graphs = model.generate_test_graphs(val_loader, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE,beam_width=config['beam_width'], num_generated_test_graphs=config['num_generated_test_graphs'], device=device) 
-                # print("\nExample graph (conditioned on test entities):")
-                # print(ints_to_labels(generated_graphs,i2e,i2r)[0])
-                # sem_eval = run_semantic_evaluation(ints_to_labels(generated_graphs, i2e, i2r),train_g, i2e, i2r, verifier, title="graphs conditioned on test entities")
-                # res = sem_eval.organized_results["results"]
-
-                # wandb.log({
-                #     "verification/cond_validity_rate":       res.get("semantics", 0.0) / 100.0,
-                #     "verification/cond_novelty_rate":        res.get("novel", 0.0) / 100.0,
-                #     "verification/cond_valid_novelty_rate":  res.get("novel_semantics", 0.0) / 100.0,
-                # })
-
-                # print(f"Verification — validity: {res.get('semantics',0.0):.2f}% | "
-                #     f"novelty: {res.get('novel',0.0):.2f}% | "
-                #     f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
                 
-                
-                #generate graphs from standard normal and evaluate
-                # z_rand = torch.randn(config['num_generated_latent_graphs'], config['d_latent'], device=device)
-                # latent_graphs = model.decode_latent(z_rand, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE, beam=1)
-                # print("\nExample graph (random latent):")
-                # print(ints_to_labels(latent_graphs, i2e, i2r)[0])
-                # run_semantic_evaluation(ints_to_labels(latent_graphs, i2e, i2r), train_g, i2e, i2r, verifier, title="graphs from random latent")
                 target_N   = config.get('num_generated_latent_graphs', 10000)
                 chunk_size = 50
                 d_latent   = config['d_latent']
@@ -794,8 +734,7 @@ def main():
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            # Handle DataParallel when saving
-            # model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict() 
+
             model_state = model.state_dict()            
             vocabs = {
         'e2i': e2i, 'i2e': i2e,
@@ -825,8 +764,7 @@ def main():
             print(f"Saved best model with validation loss: {val_loss:.4f}")
         
         if (epoch + 1) % config.get('save_every', 10) == 0:
-            # Handle DataParallel when saving
-            # model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+
             model_state = model.state_dict()
             vocabs = {
         'e2i': e2i, 'i2e': i2e,
@@ -863,6 +801,3 @@ if __name__ == "__main__":
     main()
 
 
-
-#TOD: ANONYMITY CHECK
-#TOD : FOR THE CONFIGS MAKE SURE THAT THE TEMPERATURE TOP P AND TOP K ARE THERE FOR ARK
