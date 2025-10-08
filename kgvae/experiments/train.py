@@ -24,7 +24,7 @@ from kgvae.model.utils import GraphSeqDataset
 from kgvae.model.verification import get_verifier
 from kgvae.model.utils import  ints_to_labels,  seq_to_triples
 from kgvae.model.verification import run_semantic_evaluation
-from kgvae.model.utils import canonical_graph_string
+
 
 
 
@@ -327,10 +327,6 @@ def main():
     i2e = {idx: entity for entity, idx in entity_map.items()}
     i2r = {idx: relation for relation, idx in relation_map.items()}
     
-    #autoreg model specific configurations
-    # (train_g, val_g, test_g,(e2i, _),(r2i, _),(min_edges, max_edges), _) = load_data_as_list(dataset_name)
-    # if model_type == 'autoreg':
-    #     (train_g, val_g, test_g,(e2i, i2e),(r2i, i2r),(min_edges, max_edges), _) = load_data_as_list(dataset_name)
     (train_g, val_g, test_g,(e2i, i2e),(r2i, i2r),(min_edges, max_edges), _) = load_data_as_list(dataset_name)
 
     num_entities  = len(e2i)
@@ -453,17 +449,10 @@ def main():
     
     print(f"Using model: {model_type}")
     
-    # Support multi-GPU training if available
-    # if torch.cuda.device_count() > 1:
-    #     print(f"Using {torch.cuda.device_count()} GPUs for training")
-    #     model = torch.nn.DataParallel(model)
-    
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
     
     scheduler = None
     if config.get('lr_scheduler', False):
-        #the scheduler that works better because of beta annealing
-        #if the model is autoregressive, we use CosineAnnealingLR
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=config['num_epochs'],
@@ -577,8 +566,6 @@ def main():
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            # Handle DataParallel when saving
-            # model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict() 
             model_state = model.state_dict()            
             vocabs = {
         'e2i': e2i, 'i2e': i2e,
@@ -608,8 +595,6 @@ def main():
             print(f"Saved best model with validation loss: {val_loss:.4f}")
         
         if (epoch + 1) % config.get('save_every', 10) == 0:
-            # Handle DataParallel when saving
-            # model_state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
             model_state = model.state_dict()
             vocabs = {
         'e2i': e2i, 'i2e': i2e,
@@ -645,7 +630,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-
-
-#TOD: ANONYMITY CHECK
-#TOD : FOR THE CONFIGS MAKE SURE THAT THE TEMPERATURE TOP P AND TOP K ARE ONLY FOR ARK
