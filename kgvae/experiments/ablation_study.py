@@ -376,7 +376,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
     parser.add_argument('--wandb-project', type=str, default='submission', help='Weights & Biases project name')
-    parser.add_argument('--wandb-entity', type=str, default='a-vozikis-vrije-universiteit-amsterdam', help='Weights & Biases entity')
+    parser.add_argument('--wandb-entity', type=str, default=None, help='Weights & Biases entity')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints', help='Directory to save checkpoints')
     args = parser.parse_args()
     
@@ -390,12 +390,18 @@ def main():
         
     model_type = config.get('model_type', 'ARK')
     
-    wandb.init(
+    entity = args.wandb_entity or os.getenv("WANDB_ENTITY")
+
+    init_kwargs = dict(
         project=args.wandb_project,
-        entity=args.wandb_entity,
         config=config,
-        name=config.get('experiment_name', 'ARK_experiment')
+        name=config.get('experiment_name', 'ARK_experiment'),
+        anonymous="allow",  
     )
+    if entity:
+        init_kwargs["entity"] = entity
+
+    wandb.init(**init_kwargs)
     
     config = apply_overrides(config, wandb.config)
     config['learning_rate'] = float(config.get('learning_rate', 1e-3))
