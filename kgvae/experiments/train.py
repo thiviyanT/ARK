@@ -41,36 +41,18 @@ def train_epoch(model, dataloader, optimizer, config, device, b=1.0):
     
     for batch_idx, batch_triples in enumerate(tqdm(dataloader, desc="Training")):
         optimizer.zero_grad()
-        
-        if model_type == 'ARK' or model_type == 't-ARK':
-            triples, seq = batch_triples
-            seq = seq.to(device)
-            logits = model(seq[:, :-1])  
-            vocab = logits.size(-1)
-            ce = F.cross_entropy(
-                logits.reshape(-1, vocab),
-                seq[:, 1:].reshape(-1),
-                ignore_index=config["special_tokens"]["PAD"]
-            )
-            loss = ce
-            recon_loss = ce
-            kl_loss = torch.tensor(0.0, device=device)
-        #autoregressive loss for train
-        elif model_type == 'SAIL' or model_type == 't-SAIL':
-            triples, seq = batch_triples
-            triples = triples.to(device)
-            seq = seq.to(device)
-            logits, mu, logv = model(triples, seq[:, :-1])
-            vocab = logits.size(-1)
-            ce = F.cross_entropy(
-                logits.reshape(-1, vocab),
-                seq[:, 1:].reshape(-1),
-                ignore_index=config["special_tokens"]["PAD"]
-            )
-            kl = model.kl_mean(mu, logv)
-            loss = ce + b * kl
-            recon_loss = ce
-            kl_loss = kl
+        triples, seq = batch_triples
+        seq = seq.to(device)
+        logits = model(seq[:, :-1])  
+        vocab = logits.size(-1)
+        ce = F.cross_entropy(
+            logits.reshape(-1, vocab),
+            seq[:, 1:].reshape(-1),
+            ignore_index=config["special_tokens"]["PAD"]
+        )
+        loss = ce
+        recon_loss = ce
+        kl_loss = torch.tensor(0.0, device=device)
                 
         loss.backward()
         optimizer.step()
@@ -107,36 +89,18 @@ def validate(model, dataloader, config, device, compute_compression=False, b=1.0
     
     with torch.no_grad():
         for batch_triples in tqdm(dataloader, desc="Validation"):
-            if model_type == 'ARK' or model_type == 't-ARK':
-                triples, seq = batch_triples
-                seq = seq.to(device)
-                logits = model(seq[:, :-1])  # predict next tokens
-                vocab = logits.size(-1)
-                ce = F.cross_entropy(
-                    logits.reshape(-1, vocab),
-                    seq[:, 1:].reshape(-1),
-                    ignore_index=config["special_tokens"]["PAD"]
-                )
-                loss = ce
-                recon_loss = ce
-                kl_loss = torch.tensor(0.0, device=device)
-            #autoregressive loss for validation
-            elif model_type == 'SAIL' or model_type == 't-SAIL':
-                triples, seq = batch_triples
-                triples = triples.to(device)
-                seq = seq.to(device)
-                logits, mu, logv = model(triples, seq[:, :-1])
-                vocab = logits.size(-1)
-                ce = F.cross_entropy(
-                    logits.reshape(-1, vocab),
-                    seq[:, 1:].reshape(-1),
-                    ignore_index=config["special_tokens"]["PAD"]
-                )
-                kl = model.kl_mean(mu, logv)
-                loss = ce + b * kl
-                recon_loss = ce
-                kl_loss = kl
-                
+            triples, seq = batch_triples
+            seq = seq.to(device)
+            logits = model(seq[:, :-1])  # predict next tokens
+            vocab = logits.size(-1)
+            ce = F.cross_entropy(
+                logits.reshape(-1, vocab),
+                seq[:, 1:].reshape(-1),
+                ignore_index=config["special_tokens"]["PAD"]
+            )
+            loss = ce
+            recon_loss = ce
+            kl_loss = torch.tensor(0.0, device=device)    
             total_loss += loss.item()
             total_recon_loss += recon_loss.item()
             total_kl_loss += kl_loss.item()
@@ -147,44 +111,22 @@ def validate(model, dataloader, config, device, compute_compression=False, b=1.0
     avg_kl_loss = total_kl_loss / num_batches if num_batches > 0 else 0
     avg_entity_loss = total_entity_loss / num_batches if num_batches > 0 else 0
 
-
-    if compute_compression and (model_type == 'ARK' or model_type == 't-ARK'):
-        stats = model.posterior_bits(
-            dataloader.dataset,
-            device,
-            pad_id=special_tokens["PAD"],
-            sample_frac=config['sample_frac'],
-            desc="Posterior compression"
-        )
-        print("\n[Final Posterior Compression on Validation/Test Set]")
-        print(f" Final Avg total bits: {stats['avg_total_bits']:.2f}")
-        print(f" Final Avg AR bits:    {stats['avg_ar_bits']:.2f}")
-        avg_compression_bits = stats['avg_total_bits']
-        avg_kl_bits = stats['avg_kl_bits']        
-        avg_entity_bits = stats['avg_ar_bits']   
-        avg_edge_bits = stats['avg_ar_bits']
-        return (avg_loss, avg_recon_loss, avg_kl_loss, avg_entity_loss,
-                avg_compression_bits, avg_kl_bits, avg_edge_bits, avg_entity_bits)
-    elif compute_compression and (model_type == 'SAIL' or model_type == 't-SAIL'):
-        #posterior compression bits for autoregressive model.
-        stats = model.posterior_bits(
-            dataloader.dataset,
-            device,
-            pad_id=special_tokens["PAD"],
-            sample_frac=config['sample_frac'],
-            desc="Posterior compression"
-        )
-        print("\n[Final Posterior Compression on Test Set]")
-        print(f" Final  Avg total bits: {stats['avg_total_bits']:.2f}")
-        print(f" Final Avg AR bits:    {stats['avg_ar_bits']:.2f}")
-        print(f" Final Avg KL bits:    {stats['avg_kl_bits']:.2f}")
-        avg_compression_bits = stats['avg_total_bits']
-        avg_kl_bits = stats['avg_kl_bits']
-        avg_entity_bits = stats['avg_ar_bits']
-        avg_edge_bits = stats['avg_ar_bits']
-
-        return avg_loss, avg_recon_loss, avg_kl_loss, avg_entity_loss, avg_compression_bits, avg_kl_bits, avg_edge_bits, avg_entity_bits
-    return avg_loss, avg_recon_loss, avg_kl_loss, avg_entity_loss
+    stats = model.posterior_bits(
+        dataloader.dataset,
+        device,
+        pad_id=special_tokens["PAD"],
+        sample_frac=config['sample_frac'],
+        desc="Posterior compression"
+    )
+    print("\n[Final Posterior Compression on Validation/Test Set]")
+    print(f" Final Avg total bits: {stats['avg_total_bits']:.2f}")
+    print(f" Final Avg AR bits:    {stats['avg_ar_bits']:.2f}")
+    avg_compression_bits = stats['avg_total_bits']
+    avg_kl_bits = stats['avg_kl_bits']        
+    avg_entity_bits = stats['avg_ar_bits']   
+    avg_edge_bits = stats['avg_ar_bits']
+    return (avg_loss, avg_recon_loss, avg_kl_loss, avg_entity_loss,
+            avg_compression_bits, avg_kl_bits, avg_edge_bits, avg_entity_bits)
 
 
 def final_validation(model, test_loader, val_loader, config, device, verifier, i2e, i2r, b = 1.0, special_tokens=None, seq_len=None, ENT_BASE=None, REL_BASE=None, train_g=None):    
@@ -250,123 +192,47 @@ def final_validation(model, test_loader, val_loader, config, device, verifier, i
               f"(KL: {final_kl_bits:.2f}, Edge: {final_edge_bits:.2f}, Entity: {final_entity_bits:.2f})")
     
     # Final verification
-    if verifier:
-        if model_type == 'ARK' or model_type == 't-ARK':                
-            target_N = config.get('num_generated_latent_graphs', 1000)
-            chunk_size = 50
-            all_batches = []
+    if verifier:            
+        target_N = config.get('num_generated_latent_graphs', 1000)
+        chunk_size = 50
+        all_batches = []
 
-            while sum(x.size(0) for x in all_batches) < target_N:
-                with torch.inference_mode():
-                    seq_batch = model.generate(
-                        seq_len, special_tokens,
-                        device=device,
-                        batch_size=chunk_size,
-                        beam=1,
-                        sample=True,
-                        temperature=config.get('temperature', 1.0),
-                        top_p=config.get('top_p', 0.9),
-                        top_k=config.get('top_k', 0)
-                    ).cpu()
-                all_batches.append(seq_batch)
-
-            seq_batch = torch.cat(all_batches, dim=0)[:target_N]
-
-            graphs = [seq_to_triples(row.cpu(), special_tokens, ENT_BASE, REL_BASE) for row in seq_batch]
-            labels = ints_to_labels(graphs, i2e, i2r)
-
-            print("\nExample graphs (ARK):")
-            for k in range(min(5, len(labels))):
-                print(f"[{k}] {labels[k]}")              
-
-            sem_eval = run_semantic_evaluation(labels, train_g, i2e, i2r, verifier, title="ARK samples")
-            res = sem_eval.organized_results["results"]
-
-            # Also include in the final metrics dict returned by final_validation
-            log_dict.update({
-                f'final_{eval_set_name}/validity_rate':      res.get("semantics", 0.0) / 100.0,
-                f'final_{eval_set_name}/novelty_rate':       res.get("novel", 0.0) / 100.0,
-                f'final_{eval_set_name}/valid_novelty_rate': res.get("novel_semantics", 0.0) / 100.0,
-            })
-
-            print(f"Final {eval_set_name} — validity: {res.get('semantics',0.0):.2f}% | "
-                f"novelty: {res.get('novel',0.0):.2f}% | "
-                f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
-
-
-        elif model_type == 'SAIL' or model_type == 't-SAIL':
-            #generate graphs conditioned on test entities and also from standard normal and evaluate on their validity and novelty
-            # generated_graphs = model.generate_test_graphs(test_loader, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE,beam_width=config['beam_width'], num_generated_test_graphs=config['num_generated_test_graphs'], device=device) 
-            # print("\nExample graph (conditioned on test entities):")
-            # print(ints_to_labels(generated_graphs,i2e,i2r)[0])
-            # sem_eval = run_semantic_evaluation(ints_to_labels(generated_graphs, i2e, i2r),train_g, i2e, i2r, verifier, title="graphs conditioned on test entities")
-            # res = sem_eval.organized_results["results"]
-
-            # # Also include in the final metrics dict returned by final_validation
-            # log_dict.update({
-            #     f'final_{eval_set_name}/cond_validity_rate':      res.get("semantics", 0.0) / 100.0,
-            #     f'final_{eval_set_name}/cond_novelty_rate':       res.get("novel", 0.0) / 100.0,
-            #     f'final_{eval_set_name}/cond_valid_novelty_rate': res.get("novel_semantics", 0.0) / 100.0,
-            # })
-
-            # print(f"Final {eval_set_name} — validity: {res.get('semantics',0.0):.2f}% | "
-            #     f"novelty: {res.get('novel',0.0):.2f}% | "
-            #     f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
-            
-            # z_rand = torch.randn(config['num_generated_latent_graphs'], config['d_latent'], device=device)
-            # latent_graphs = model.decode_latent(z_rand, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE, beam=1)
-            # print("\nExample graph (random latent):")
-            # print(ints_to_labels(latent_graphs, i2e, i2r)[0])
-            # run_semantic_evaluation(ints_to_labels(latent_graphs, i2e, i2r), train_g, i2e, i2r, verifier, title="graphs from random latent")
-            
-            target_N   = config.get('num_generated_latent_graphs', 10000)
-            chunk_size = 50
-            d_latent   = config['d_latent']
-
-            latent_graphs = []
-            left = target_N
+        while sum(x.size(0) for x in all_batches) < target_N:
             with torch.inference_mode():
-                while left > 0:
-                    bs = min(chunk_size, left)
-                    z  = torch.randn(bs, d_latent, device=device)
-                    g_chunk = model.decode_latent(
-                        z, seq_len, special_tokens, seq_to_triples,
-                        ENT_BASE, REL_BASE, beam=1
-                    )
-                    latent_graphs.extend(g_chunk)
-                    left -= bs
+                seq_batch = model.generate(
+                    seq_len, special_tokens,
+                    device=device,
+                    batch_size=chunk_size,
+                    beam=1,
+                    sample=True,
+                    temperature=config.get('temperature', 1.0),
+                    top_p=config.get('top_p', 0.9),
+                    top_k=config.get('top_k', 0)
+                ).cpu()
+            all_batches.append(seq_batch)
 
-            print("\nExample graph (random latent):")
-            print(ints_to_labels(latent_graphs, i2e, i2r)[0])
+        seq_batch = torch.cat(all_batches, dim=0)[:target_N]
 
-            # Run semantic eval ONCE for random-latent graphs
-            sem_eval = run_semantic_evaluation(
-                ints_to_labels(latent_graphs, i2e, i2r),
-                train_g, i2e, i2r, verifier,
-                title="graphs from random latent"
-            )
-            res = sem_eval.organized_results["results"]
+        graphs = [seq_to_triples(row.cpu(), special_tokens, ENT_BASE, REL_BASE) for row in seq_batch]
+        labels = ints_to_labels(graphs, i2e, i2r)
 
-            # Also include in the final metrics dict returned by final_validation
-            log_dict.update({
-                f'final_{eval_set_name}/latent_validity_rate':      res.get("semantics", 0.0) / 100.0,
-                f'final_{eval_set_name}/latent_novelty_rate':       res.get("novel", 0.0) / 100.0,
-                f'final_{eval_set_name}/latent_valid_novelty_rate': res.get("novel_semantics", 0.0) / 100.0,
-            })
+        print("\nExample graphs (ARK):")
+        for k in range(min(5, len(labels))):
+            print(f"[{k}] {labels[k]}")              
 
-            print(f"Final {eval_set_name} — validity: {res.get('semantics',0.0):.2f}% | "
-                f"novelty: {res.get('novel',0.0):.2f}% | "
-                f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
-            
-            # decode_fn = lambda z, beam=1: model.decode_latent(z, seq_len, special_tokens,seq_to_triples, ENT_BASE, REL_BASE, beam=beam)
-            # div = model.count_unique_graphs(config['d_latent'], decode_fn, num_samples=config['num_diversity_samples'], beam=1)
-            # wandb.log({"diversity/unique_graphs": len(div),
-            #     "diversity/ratio": len(div) / (100 if config['dataset']=="wd-articles" else 10000)}) 
-            uniq = {canonical_graph_string(g) for g in latent_graphs}
-            wandb.log({
-                "diversity/unique_graphs": len(uniq),
-                "diversity/ratio": len(uniq) / len(latent_graphs)
-            })
+        sem_eval = run_semantic_evaluation(labels, train_g, i2e, i2r, verifier, title="ARK samples")
+        res = sem_eval.organized_results["results"]
+
+        # Also include in the final metrics dict returned by final_validation
+        log_dict.update({
+            f'final_{eval_set_name}/validity_rate':      res.get("semantics", 0.0) / 100.0,
+            f'final_{eval_set_name}/novelty_rate':       res.get("novel", 0.0) / 100.0,
+            f'final_{eval_set_name}/valid_novelty_rate': res.get("novel_semantics", 0.0) / 100.0,
+        })
+
+        print(f"Final {eval_set_name} — validity: {res.get('semantics',0.0):.2f}% | "
+            f"novelty: {res.get('novel',0.0):.2f}% | "
+            f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
 
             
     print("="*50)
@@ -481,14 +347,34 @@ def main():
     seq_len    = 1 + max_edges * 3 + 1
     
     #custom dataset class because of different ordering/shuffling etc 
-    if model_type in ('ARK', 't-ARK', 'SAIL', 't-SAIL'):
-        train_loader = PDataLoader(
+    train_loader = PDataLoader(
+    GraphSeqDataset(
+        graphs=train_g,
+        i2e=i2e,
+        i2r=i2r,
+        triple_order=config["triple_order"],
+        permute= config.get("permute_triples", False),
+        use_padding=use_padding,
+        pad_eid=PAD_EID,
+        pad_rid=PAD_RID,
+        max_triples=max_edges,
+        special_tokens=special_tokens,
+        ent_base=ENT_BASE,
+        rel_base=REL_BASE,
+        seq_len=seq_len,
+    ),
+    batch_size=config['batch_size'],
+    shuffle=config['shuffle_train'],
+    drop_last=True,
+)
+
+    val_loader = PDataLoader(
         GraphSeqDataset(
-            graphs=train_g,
+            graphs=val_g,
             i2e=i2e,
             i2r=i2r,
-            triple_order=config["triple_order"],
-            permute= config.get("permute_triples", False),
+            triple_order=config['triple_order'],
+            permute=config.get("permute_triples", False),
             use_padding=use_padding,
             pad_eid=PAD_EID,
             pad_rid=PAD_RID,
@@ -498,48 +384,27 @@ def main():
             rel_base=REL_BASE,
             seq_len=seq_len,
         ),
-        batch_size=config['batch_size'],
-        shuffle=config['shuffle_train'],
-        drop_last=True,
+        batch_size=config['batch_size']
     )
 
-        val_loader = PDataLoader(
-            GraphSeqDataset(
-                graphs=val_g,
-                i2e=i2e,
-                i2r=i2r,
-                triple_order=config['triple_order'],
-                permute=config.get("permute_triples", False),
-                use_padding=use_padding,
-                pad_eid=PAD_EID,
-                pad_rid=PAD_RID,
-                max_triples=max_edges,
-                special_tokens=special_tokens,
-                ent_base=ENT_BASE,
-                rel_base=REL_BASE,
-                seq_len=seq_len,
-            ),
-            batch_size=config['batch_size']
-        )
-
-        test_loader = PDataLoader(
-            GraphSeqDataset(
-                graphs=test_g,
-                i2e=i2e,
-                i2r=i2r,
-                triple_order=config['triple_order'],
-                permute=config.get("permute_triples", False),
-                use_padding=use_padding,
-                pad_eid=PAD_EID,
-                pad_rid=PAD_RID,
-                max_triples=max_edges,
-                special_tokens=special_tokens,
-                ent_base=ENT_BASE,
-                rel_base=REL_BASE,
-                seq_len=seq_len,
-            ),
-            batch_size=config['batch_size']
-        )
+    test_loader = PDataLoader(
+        GraphSeqDataset(
+            graphs=test_g,
+            i2e=i2e,
+            i2r=i2r,
+            triple_order=config['triple_order'],
+            permute=config.get("permute_triples", False),
+            use_padding=use_padding,
+            pad_eid=PAD_EID,
+            pad_rid=PAD_RID,
+            max_triples=max_edges,
+            special_tokens=special_tokens,
+            ent_base=ENT_BASE,
+            rel_base=REL_BASE,
+            seq_len=seq_len,
+        ),
+        batch_size=config['batch_size']
+    )
     
     # Update config with dataset statistics
     config['n_entities'] = len(entity_map)
@@ -573,21 +438,9 @@ def main():
         model = ARK(config).to(device)
         
     #autoregressive modeland get the configs to work
-    elif model_type == 'SAIL' or model_type == 't-SAIL':
-        config.update({
-    "n_entities": num_entities,
-    "n_relations": num_relations,
-    "pad_eid": PAD_EID,
-    "pad_rid": PAD_RID,
-    "seq_len": seq_len,
-    "vocab_size": VOCAB_SIZE,
-    "special_tokens": special_tokens,
-    "ENT_BASE": ENT_BASE,
-    "REL_BASE": REL_BASE})
-        model = SAIL(config).to(device)
     else:
         raise NotImplementedError(
-            f"Model type '{model_type}' is not implemented. Use one of: 'ARK','t-ARK','SAIL','t-SAIL'."
+            f"Model type '{model_type}' is not implemented. Use one of: 'ARK','t-ARK'."
         )
 
     
@@ -604,12 +457,11 @@ def main():
     if config.get('lr_scheduler', False):
         #the scheduler that works better because of beta annealing
         #if the model is autoregressive, we use CosineAnnealingLR
-        if model_type in ('ARK', 't-ARK', 'SAIL', 't-SAIL'):
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=config['num_epochs'],
-                eta_min=config.get('eta_min', 1e-6)
-            )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=config['num_epochs'],
+            eta_min=config.get('eta_min', 1e-6)
+        )
     
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     
@@ -618,8 +470,6 @@ def main():
     for epoch in range(config['num_epochs']):
         print(f"\nEpoch {epoch + 1}/{config['num_epochs']}")
         b = 1
-        if model_type == 'SAIL' or model_type == 't-SAIL':
-            b = config['beta0'] + (config['beta1'] - config['beta0']) * epoch / config['num_epochs']
 
         train_results = train_epoch(model, train_loader, optimizer, config, device,b)
         
@@ -668,119 +518,51 @@ def main():
         
         # Periodically verify generated graphs
         if verifier and (epoch + 1) % config.get('verify_every', 10) == 0:
-            if model_type == 'ARK' or model_type == 't-ARK':
-                target_N = config.get('num_generated_latent_graphs', 1000)
-                chunk_size = 50
-                all_batches = []
+            target_N = config.get('num_generated_latent_graphs', 1000)
+            chunk_size = 50
+            all_batches = []
 
-                while sum(x.size(0) for x in all_batches) < target_N:
-                    with torch.inference_mode():
-                        seq_batch = model.generate(
-                            seq_len, special_tokens,
-                            device=device,
-                            batch_size=chunk_size,
-                            beam=1,
-                            sample=True,
-                            temperature=config.get('temperature', 1.0),
-                            top_p=config.get('top_p', 0.9),
-                            top_k=config.get('top_k', 0)
-                        ).cpu()
-                    all_batches.append(seq_batch)
-
-                seq_batch = torch.cat(all_batches, dim=0)[:target_N]
-
-                graphs = [seq_to_triples(row.cpu(), special_tokens, ENT_BASE, REL_BASE) for row in seq_batch]
-                labels = ints_to_labels(graphs, i2e, i2r)
-
-                print("\nExample graphs (decoder-only):")
-                for k in range(min(5, len(labels))):
-                    print(f"[{k}] {labels[k]}")
-
-                sem_eval = run_semantic_evaluation(labels, train_g, i2e, i2r, verifier, title="decoder-only samples")
-                res = sem_eval.organized_results["results"]
-
-                wandb.log({
-                    "verification/validity_rate":       res.get("semantics", 0.0) / 100.0,
-                    "verification/novelty_rate":        res.get("novel", 0.0) / 100.0,
-                    "verification/valid_novelty_rate":  res.get("novel_semantics", 0.0) / 100.0,
-                })
-
-                print(f"Verification — validity: {res.get('semantics',0.0):.2f}% | "
-                    f"novelty: {res.get('novel',0.0):.2f}% | "
-                    f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
-
-
-            elif model_type == 'SAIL' or model_type == 't-SAIL':
-                #generate graphs conditioned on test entities and evaluate
-                # generated_graphs = model.generate_test_graphs(val_loader, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE,beam_width=config['beam_width'], num_generated_test_graphs=config['num_generated_test_graphs'], device=device) 
-                # print("\nExample graph (conditioned on test entities):")
-                # print(ints_to_labels(generated_graphs,i2e,i2r)[0])
-                # sem_eval = run_semantic_evaluation(ints_to_labels(generated_graphs, i2e, i2r),train_g, i2e, i2r, verifier, title="graphs conditioned on test entities")
-                # res = sem_eval.organized_results["results"]
-
-                # wandb.log({
-                #     "verification/cond_validity_rate":       res.get("semantics", 0.0) / 100.0,
-                #     "verification/cond_novelty_rate":        res.get("novel", 0.0) / 100.0,
-                #     "verification/cond_valid_novelty_rate":  res.get("novel_semantics", 0.0) / 100.0,
-                # })
-
-                # print(f"Verification — validity: {res.get('semantics',0.0):.2f}% | "
-                #     f"novelty: {res.get('novel',0.0):.2f}% | "
-                #     f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
-                
-                
-                #generate graphs from standard normal and evaluate
-                # z_rand = torch.randn(config['num_generated_latent_graphs'], config['d_latent'], device=device)
-                # latent_graphs = model.decode_latent(z_rand, seq_len, special_tokens, seq_to_triples,ENT_BASE, REL_BASE, beam=1)
-                # print("\nExample graph (random latent):")
-                # print(ints_to_labels(latent_graphs, i2e, i2r)[0])
-                # run_semantic_evaluation(ints_to_labels(latent_graphs, i2e, i2r), train_g, i2e, i2r, verifier, title="graphs from random latent")
-                target_N   = config.get('num_generated_latent_graphs', 10000)
-                chunk_size = 50
-                d_latent   = config['d_latent']
-
-                latent_graphs = []
-                left = target_N
+            while sum(x.size(0) for x in all_batches) < target_N:
                 with torch.inference_mode():
-                    while left > 0:
-                        bs = min(chunk_size, left)
-                        z  = torch.randn(bs, d_latent, device=device)
-                        g_chunk = model.decode_latent(
-                            z, seq_len, special_tokens, seq_to_triples,
-                            ENT_BASE, REL_BASE, beam=1
-                        )
-                        latent_graphs.extend(g_chunk)
-                        left -= bs
+                    seq_batch = model.generate(
+                        seq_len, special_tokens,
+                        device=device,
+                        batch_size=chunk_size,
+                        beam=1,
+                        sample=True,
+                        temperature=config.get('temperature', 1.0),
+                        top_p=config.get('top_p', 0.9),
+                        top_k=config.get('top_k', 0)
+                    ).cpu()
+                all_batches.append(seq_batch)
 
-                print("\nExample graph (random latent):")
-                print(ints_to_labels(latent_graphs, i2e, i2r)[0])
+            seq_batch = torch.cat(all_batches, dim=0)[:target_N]
 
-                # Run semantic eval ONCE for random-latent graphs
-                sem_eval = run_semantic_evaluation(
-                    ints_to_labels(latent_graphs, i2e, i2r),
-                    train_g, i2e, i2r, verifier,
-                    title="graphs from random latent"
-                )
-                res = sem_eval.organized_results["results"]
+            graphs = [seq_to_triples(row.cpu(), special_tokens, ENT_BASE, REL_BASE) for row in seq_batch]
+            labels = ints_to_labels(graphs, i2e, i2r)
 
-                wandb.log({
-                    "verification/latent_validity_rate":       res.get("semantics", 0.0) / 100.0,
-                    "verification/latent_novelty_rate":        res.get("novel", 0.0) / 100.0,
-                    "verification/latent_valid_novelty_rate":  res.get("novel_semantics", 0.0) / 100.0,
-                })
+            print("\nExample graphs (decoder-only):")
+            for k in range(min(5, len(labels))):
+                print(f"[{k}] {labels[k]}")
 
-                print(f"Verification — validity: {res.get('semantics',0.0):.2f}% | "
-                    f"novelty: {res.get('novel',0.0):.2f}% | "
-                    f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
+            sem_eval = run_semantic_evaluation(labels, train_g, i2e, i2r, verifier, title="decoder-only samples")
+            res = sem_eval.organized_results["results"]
+
+            wandb.log({
+                "verification/validity_rate":       res.get("semantics", 0.0) / 100.0,
+                "verification/novelty_rate":        res.get("novel", 0.0) / 100.0,
+                "verification/valid_novelty_rate":  res.get("novel_semantics", 0.0) / 100.0,
+            })
+
+            print(f"Verification — validity: {res.get('semantics',0.0):.2f}% | "
+                f"novelty: {res.get('novel',0.0):.2f}% | "
+                f"valid&novel: {res.get('novel_semantics',0.0):.2f}%")
+
         
         wandb.log(log_dict)
         
-        if model_type in ('SAIL', 't-SAIL'):
-            print(f"Train Loss: {train_loss:.4f} (Recon: {train_recon_loss:.4f}, KL: {train_kl_loss:.4f})")
-            print(f"Val   Loss: {val_loss:.4f} (Recon: {val_recon_loss:.4f}, KL: {val_kl_loss:.4f})")
-        else:  # dec_only
-            print(f"Train Loss: {train_loss:.4f} (Recon: {train_recon_loss:.4f})")
-            print(f"Val   Loss: {val_loss:.4f} (Recon: {val_recon_loss:.4f})")
+        print(f"Train Loss: {train_loss:.4f} (Recon: {train_recon_loss:.4f})")
+        print(f"Val   Loss: {val_loss:.4f} (Recon: {val_recon_loss:.4f})")
 
         if scheduler is not None:
             if config.get('lr_scheduler', False):
@@ -855,3 +637,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+#TOD: ANONYMITY CHECK
+#TOD : FOR THE CONFIGS MAKE SURE THAT THE TEMPERATURE TOP P AND TOP K ARE ONLY FOR ARK
