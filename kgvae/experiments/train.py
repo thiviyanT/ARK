@@ -276,11 +276,9 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
     args.checkpoint_dir = run_dir
 
-    # (nice to have) save effective config for reproducibility
     with open(os.path.join(run_dir, "effective_config.yaml"), "w") as f:
         yaml.safe_dump(config, f)
 
-    # --- NEW: init objective tracking for the sweep ---
     best_comp_bits = 1e12
     wandb.log({'objective': best_comp_bits})
 
@@ -440,7 +438,6 @@ def main():
         })
         model = ARK(config).to(device)
         
-    #autoregressive modeland get the configs to work
     else:
         raise NotImplementedError(
             f"Model type '{model_type}' is not implemented. Use one of: 'ARK','t-ARK'."
