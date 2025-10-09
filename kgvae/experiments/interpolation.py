@@ -916,7 +916,7 @@ def main():
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
     parser.add_argument('--wandb-project', type=str, default='submission', help='Weights & Biases project name')
-    parser.add_argument('--wandb-entity', type=str, default='a-vozikis-vrije-universiteit-amsterdam', help='W&B entity')
+    parser.add_argument('--wandb-entity', type=str, default=None, help='Weights & Biases entity')
     parser.add_argument('--directions', type=int, default=20)
 
     parser.add_argument('--epsilon', type=float, default=0.1)
