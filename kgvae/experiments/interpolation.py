@@ -17,12 +17,9 @@ except ImportError:
 from sklearn.manifold import TSNE
 import networkx as nx
 from typing import List, Dict, Tuple, Set
-from kgvae.model.rescal_vae_model import RESCALVAE
-from kgvae.model.models import AutoRegModel
+from kgvae.model.models import SAIL
 from kgvae.model.utils import seq_to_triples, ints_to_labels
-from intelligraphs.data_loaders import load_data_as_list
-from kgvae.model.verification import get_verifier, run_semantic_evaluation
-
+from intelligraphs.data_loaders import get_file_paths, parse_files_to_subgraphs
 
 
 
@@ -53,7 +50,7 @@ def decode_to_triple_set(
     special_tokens: dict,
     entity_base_idx: int,
     relation_base_idx: int,
-    beam: int = 1
+    beam: int = 3
 ) -> set:
     """
     Decode a latent vector to a set of Knowledge Graph triples.
@@ -81,6 +78,28 @@ def decode_to_triple_set(
     return set(tuple(map(int, t)) for t in decoded_graph)
 
 
+def load_graphs_with_checkpoint_vocab(dataset: str, e2i: Dict[str, int], r2i: Dict[str, int]):
+    """Load dataset triples and re-map them to checkpoint vocab ids."""
+
+    def _map_graphs(raw_graphs):
+        mapped = []
+        for graph in raw_graphs:
+            triples = []
+            for s, p, o in graph:
+                if s in e2i and p in r2i and o in e2i:
+                    triples.append((e2i[s], r2i[p], e2i[o]))
+            mapped.append(triples)
+        return mapped
+
+    train_file, val_file, test_file = get_file_paths(dataset)
+    train_raw, val_raw, test_raw = parse_files_to_subgraphs(train_file, val_file, test_file, split_tab=True)
+
+    return (
+        _map_graphs(train_raw),
+        _map_graphs(val_raw),
+        _map_graphs(test_raw),
+    )
+
 
 def load_model(checkpoint_dir, dataset, model_type, epoch=None, device=None):
     """
@@ -89,7 +108,7 @@ def load_model(checkpoint_dir, dataset, model_type, epoch=None, device=None):
     Args:
         checkpoint_dir: Directory containing model checkpoints
         dataset: Name of the dataset (e.g., 'syn-paths')
-        model_type: Type of model ('autoreg' or 'rescal_vae')
+        model_type: Type of model ('SAIL' or 't-SAIL')
         epoch: Specific epoch to load, or None for best model
         device: Device to load model on ('cuda' or 'cpu'), auto-detected if None
     
@@ -108,14 +127,21 @@ def load_model(checkpoint_dir, dataset, model_type, epoch=None, device=None):
 
     ckpt = torch.load(ckpt_path, map_location=device)
     config = ckpt["config"]
+
+    val = config.get("ablation_encoder")
+    if not val or str(val).lower() == "none":
+        config["ablation_encoder"] = "Transformer"
+
+    val = config.get("ablation_decoder")
+    if not val or str(val).lower() == "none":
+        config["ablation_decoder"] = "Transformer"
+
     state = ckpt["model_state_dict"]
     if any(k.startswith("module.") for k in state):
         state = {k.replace("module.", "", 1): v for k, v in state.items()}
 
-    if model_type == "autoreg":
-        model = AutoRegModel(config).to(device)
-    elif model_type == "rescal_vae":
-        model = RESCALVAE(config).to(device)
+    if model_type == "SAIL" or model_type == "t-SAIL":
+        model = SAIL(config).to(device)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -161,11 +187,11 @@ def random_steps_latent_autoreg(model, i2e, i2r, n_directions=20, epsilon=1.2, d
     directions = directions / directions.norm(dim=1, keepdim=True).clamp_min(1e-12)
     perturbed_zs = z0.unsqueeze(0) + epsilon * directions 
     ref_graphs = model_unwrapped.decode_latent(
-        z0.unsqueeze(0), seq_len, special_tokens, seq_to_triples, entity_base_idx, relation_base_idx, beam=1
+        z0.unsqueeze(0), seq_len, special_tokens, seq_to_triples, entity_base_idx, relation_base_idx, beam=3
     )
     ref_triples = ints_to_labels(ref_graphs, i2e, i2r)[0]
     decoded_graphs = model_unwrapped.decode_latent(
-        perturbed_zs, seq_len, special_tokens, seq_to_triples, entity_base_idx, relation_base_idx, beam=1
+        perturbed_zs, seq_len, special_tokens, seq_to_triples, entity_base_idx, relation_base_idx, beam=3
     )
     decoded_triples = ints_to_labels(decoded_graphs, i2e, i2r)
     print("\n=== Local Latent Neighborhood Exploration ===")
@@ -182,7 +208,7 @@ def random_steps_latent_autoreg(model, i2e, i2r, n_directions=20, epsilon=1.2, d
         print(f"# Overlapping triples with z₀: {len(overlap)} / {denom}")
           
 @torch.no_grad()
-def smoothness_line_check_autoreg(model, i2e, i2r, steps: int = 10, epsilon: float = 0.1, device: str = None, beam: int = 1):
+def smoothness_line_check_autoreg(model, i2e, i2r, steps: int = 10, epsilon: float = 0.1, device: str = None, beam: int = 3):
     """
     Walk along a line in latent space to measure smoothness.
     
@@ -264,7 +290,7 @@ def smoothness_line_check_autoreg(model, i2e, i2r, steps: int = 10, epsilon: flo
 
 
 @torch.no_grad()
-def latent_smoothness_score_autoreg(model, steps:int=10, epsilon:float=0.1, n_anchors:int=3, n_dirs:int=3, beam:int=1, device:str=None):
+def latent_smoothness_score_autoreg(model, steps:int=10, epsilon:float=0.1, n_anchors:int=3, n_dirs:int=3, beam:int=3, device:str=None):
     """
     Compute quantitative smoothness scores using Jaccard similarity.
     
@@ -309,7 +335,6 @@ def latent_smoothness_score_autoreg(model, steps:int=10, epsilon:float=0.1, n_an
             direction = direction / direction.norm().clamp_min(1e-12)
 
             prev = anchor
-            # march: z_s = z0 + s*epsilon*d
             for s in range(1, steps+1):
                 z = z0 + (s * epsilon) * direction
                 cur = decode_to_triple_set(model_unwrapped, z, seq_len, special_tokens, entity_base_idx, relation_base_idx, beam)
@@ -328,7 +353,7 @@ def latent_smoothness_score_autoreg(model, steps:int=10, epsilon:float=0.1, n_an
 
 
 @torch.no_grad()
-def latent_flip_rate_autoreg(model, steps:int=30, epsilon:float=0.05, n_anchors:int=5, n_dirs:int=4, beam:int=1, device:str=None):
+def latent_flip_rate_autoreg(model, steps:int=30, epsilon:float=0.05, n_anchors:int=5, n_dirs:int=4, beam:int=3, device:str=None):
     """
     Measure discreteness of latent space by tracking graph changes.
     
@@ -388,12 +413,10 @@ def latent_flip_rate_autoreg(model, steps:int=30, epsilon:float=0.05, n_anchors:
                     basin_len += 1
                     last_was_flip = False
                 prev_set = cur_set
-            # Only append the final basin if the last step wasn't a flip
-            # (if it was a flip, we already recorded that basin)
             if not last_was_flip and basin_len > 0:
                 all_basin_lengths.append(basin_len)
 
-    flip_rate = total_flips / max(1, total_steps)           # 0..1
+    flip_rate = total_flips / max(1, total_steps)           
     avg_basin = (sum(all_basin_lengths) / max(1, len(all_basin_lengths)))
     print(f"\n[FLIP RATE] anchors={n_anchors}, dirs={n_dirs}, steps={steps}, ε={epsilon}")
     print(f"Flip rate      : {flip_rate:.3f} (fraction of step transitions that change graph)")
@@ -402,26 +425,61 @@ def latent_flip_rate_autoreg(model, steps:int=30, epsilon:float=0.05, n_anchors:
 
 
 @torch.no_grad()
-def qualitative_latent_analysis_wd_movies(model, output_dir: str = "figures", n_samples: int = 500, use_all_test: bool = False, device: str = None):
+def qualitative_latent_analysis_wd_movies(
+    model,
+    vocabs: Dict[str, Dict],
+    output_dir: str = "figures",
+    n_samples: int = 5000,
+    use_all_test: bool = False,
+    device: str = None,
+    target_genres: List[str] = None,
+):
     """
-    Perform qualitative analysis of latent space for wd-movies dataset.
-    
-    Generates three visualizations:
-    1. t-SNE projection colored by movie genre
-    2. Linear interpolation path visualization
-    3. Decoded graphs at interpolation points
-    
-    Args:
-        model: Trained autoregressive VAE model
-        output_dir: Directory to save generated figures
-        n_samples: Number of test graphs to encode for t-SNE (ignored if use_all_test=True)
-        use_all_test: If True, use all graphs in test dataset
-        device: Device for computation, auto-detected if None
+    Qualitative analysis of latent space (wd-movies) with t-SNE restricted to 10 famous, diverse genres.
     """
-    import scienceplots
-    plt.style.use(['science', 'ieee', 'no-latex'])
+    import matplotlib.cm as cm
+    import matplotlib
+    try:
+        import scienceplots
+        plt.style.use(['science', 'ieee', 'no-latex'])
+    except Exception:
+        pass
 
-    
+    # ---- 10 target genres (canonical names) ----
+    if target_genres is None:
+        target_genres = [
+            'Action film',
+            'Comedy film',
+            'Drama film',
+            'Horror film',
+            'Romance film',
+            'Musical film',
+            'Science fiction film',
+            'Western film',
+            'Bollywood',
+            'Documentary film',
+        ]
+    TARGET_SET = set(target_genres)
+
+    _lower_to_canon = {g.lower(): g for g in TARGET_SET}
+
+    def extract_genres_from_graph(graph_triples: List[Tuple[str, str, str]]) -> List[str]:
+        """Extract canonical genres intersecting TARGET_SET without any manual normalization."""
+        raw = []
+        for h, r, t in graph_triples:
+            if 'has_genre' in (r or '').lower() or (r or '').lower() == 'genre':
+                raw.append((t or '').strip())
+        canon = []
+        for g in raw:
+            g_can = _lower_to_canon.get(g.lower())
+            if g_can is not None:
+                canon.append(g_can)
+        return list(dict.fromkeys(canon))
+
+
+    def get_primary_genre(genres: List[str]) -> str:
+        return genres[0] if genres else None
+
     os.makedirs(output_dir, exist_ok=True)
 
     model_unwrapped = model.module if isinstance(model, nn.DataParallel) else model
@@ -430,334 +488,410 @@ def qualitative_latent_analysis_wd_movies(model, output_dir: str = "figures", n_
     special_tokens = config["special_tokens"]
     entity_base_idx = config["ENT_BASE"]
     relation_base_idx = config["REL_BASE"]
-    
+
     if device is None:
         device = next(model_unwrapped.parameters()).device
 
-    # load wd-movies dataset
-    train_list, valid_list, test_list, (e2i, i2e), (r2i, i2r), _, _ = load_data_as_list("wd-movies")
+    if vocabs is None:
+        raise ValueError("qualitative_latent_analysis_wd_movies requires checkpoint vocabularies.")
 
-    def extract_genres_from_graph(graph_triples: List[Tuple]) -> List[str]:
-        """Extract all genres from movie graph triples using 'has_genre' relationship."""
-        genres = []
-        for h, r, t in graph_triples:
-            # Look specifically for 'has_genre' relationship
-            if 'has_genre' in r.lower() or 'genre' == r.lower():
-                genres.append(t)  # t is the genre entity
-        return genres if genres else ['unknown']
+    required_keys = ("e2i", "i2e", "r2i", "i2r")
+    missing = [k for k in required_keys if k not in vocabs or vocabs[k] is None]
+    if missing:
+        raise KeyError(f"Checkpoint vocabs missing keys: {missing}")
 
-    def get_primary_genre(genres: List[str]) -> str:
-        """Get the primary genre for visualization, prioritizing target genres."""
-        # Check if any of the genres is in target_genres
-        for genre in genres:
-            if genre in target_genres:
-                return genre
-        # If no target genre found, return 'other'
-        return 'other'
+    e2i = vocabs["e2i"]
+    i2e = vocabs["i2e"]
+    r2i = vocabs["r2i"]
+    i2r = vocabs["i2r"]
 
-    print("\n=== Preparing data for analysis ===")
-    
-    if use_all_test:
-        test_sample = test_list
-        print(f"Using all {len(test_sample)} test graphs")
-    else:
-        test_sample = test_list[:min(n_samples, len(test_list))]
-        print(f"Using {len(test_sample)} sampled test graphs")
+    _, _, test_list = load_graphs_with_checkpoint_vocab("wd-movies", e2i, r2i)
 
-    print("\n=== Extracting genres from dataset ===")
-    
-    # Define target genres to focus on
-    target_genres = [
-        'action film',
-        'comedy film', 
-        'drama film',
-        'horror film',
-        'romance film',
-        'musical film',
-        'science fiction film',
-        'Western film',
-        'Bollywood',
-        'documentary film'
-    ]
-    
-    # Define distinct colors for each genre for maximum contrast
-    distinct_colors = [
-        '#FF0000',  # Red - action film
-        '#FFD700',  # Gold - comedy film  
-        '#0000FF',  # Blue - drama film
-        '#000000',  # Black - horror film
-        '#FF69B4',  # Hot Pink - romance film
-        '#FF8C00',  # Dark Orange - musical film
-        '#00FF00',  # Lime Green - science fiction film
-        '#8B4513',  # Saddle Brown - Western film
-        '#9370DB',  # Medium Purple - Bollywood
-        '#00CED1'   # Dark Turquoise - documentary film
-    ]
-    
-    genre_colors = {genre: color for genre, color in zip(target_genres, distinct_colors)}
-    genre_colors['other'] = '#C0C0C0'  # Silver gray for other genres
-    
-    all_genres_set = set()
-    for graph in test_sample:
+    test_sample = test_list if use_all_test else test_list[:min(n_samples, len(test_list))]
+
+    latent_vectors = []
+    primary_genres = []
+    kept_idx = []
+
+    for graph_idx, graph in enumerate(test_sample):
+        # labels for genre extraction
         graph_labels = ints_to_labels([graph], i2e, i2r)[0]
         genres = extract_genres_from_graph(graph_labels)
-        all_genres_set.update(genres)
-    
-    print(f"Found {len(all_genres_set)} unique genres in dataset")
-    print(f"Target genres for visualization: {target_genres}")
-    
-    unique_genres = target_genres  # Focus only on target genres
-    n_genres = len(unique_genres)
+        primary = get_primary_genre(genres)
 
-    print("\n=== Encoding graphs to latent space ===")
-    
-    latent_vectors = []
-    all_genres_list = []
-    primary_genres = []  # primary genre for each graph (for coloring)
-    
-    for graph_idx, graph in enumerate(test_sample):
-        if graph_idx % 50 == 0:
-            print(f"Encoding graph {graph_idx}/{len(test_sample)}")
-        
-        # Convert graph to tensor format for encoding
-        # The AutoRegEncoder expects triples in shape (batch_size, num_triples, 3)
-        # where each triple is [subject_id, relation_id, object_id]
-        
+        if primary is None:
+            continue  
+
         try:
-            # convert graph (list of triples) to tensor
-            # graph is already in integer format from the dataset
-            if len(graph) == 0:
-                continue
-                
-            # pad graph to fixed size if needed
             max_triples = config.get('max_edges', 100)
-            
-            # convert to tensor and pad if necessary
             graph_tensor = torch.zeros((1, max_triples, 3), dtype=torch.long, device=device)
             num_triples = min(len(graph), max_triples)
-            
             for i in range(num_triples):
-                if len(graph[i]) == 3:  # ensure triple has 3 elements
-                    graph_tensor[0, i, 0] = graph[i][0]  # subject
-                    graph_tensor[0, i, 1] = graph[i][1]  # relation
-                    graph_tensor[0, i, 2] = graph[i][2]  # object
-            
-            # use padding IDs if available
+                if len(graph[i]) == 3:
+                    graph_tensor[0, i, 0] = graph[i][0]
+                    graph_tensor[0, i, 1] = graph[i][1]
+                    graph_tensor[0, i, 2] = graph[i][2]
             pad_rid = config.get('pad_rid', 0)
             if num_triples < max_triples:
-                graph_tensor[0, num_triples:, 1] = pad_rid  # Mark padded triples
-            
-            # encode using the model's encoder
-            with torch.no_grad():
-                z, mu, logv = model_unwrapped.enc(graph_tensor)
-                latent_vectors.append(mu[0].cpu().numpy())  # Take first element of batch
-                    
-        except Exception as e:
-            print(f"Skipping graph {graph_idx} due to error: {e}")
-            continue
-        
-        # extract genres
-        graph_labels = ints_to_labels([graph], i2e, i2r)[0]
-        genres = extract_genres_from_graph(graph_labels)
-        all_genres_list.append(genres)
-        primary_genres.append(get_primary_genre(genres))
-    
-    if len(latent_vectors) == 0:
-        print("Warning: No graphs could be encoded. Please implement encode_graph method or graph tensor preparation.")
-        return
-    
-    latent_vectors = np.vstack(latent_vectors)
-    print(f"Encoded {len(latent_vectors)} graphs successfully")
+                graph_tensor[0, num_triples:, 1] = pad_rid
 
-    # perform t-SNE
-    print("\n=== Running t-SNE projection ===")
-    tsne = TSNE(n_components=2, perplexity=min(30, len(latent_vectors)-1),
-            random_state=42, max_iter=1000)
+            z, mu, logv = model_unwrapped.enc(graph_tensor)
+            latent_vectors.append(mu[0].cpu().numpy())
+            primary_genres.append(primary)
+            kept_idx.append(graph_idx)
+        except Exception as e:
+            continue
+
+    if len(latent_vectors) == 0:
+        print("Warning: No graphs matched the 10 target genres or encoding failed.")
+        return
+    latent_vectors = np.vstack(latent_vectors)
+
+    tsne = TSNE(
+        n_components=2,
+        perplexity=max(5, min(30, len(latent_vectors) - 1)),
+        random_state=42,
+        max_iter=1000
+    )
+    latent_2d = tsne.fit_transform(latent_vectors)
+
+
+    cmap = cm.get_cmap('tab10')
+    ordered_targets = list(target_genres)  
+    genre_colors = {g: cmap(i / 10) for i, g in enumerate(ordered_targets)}
+
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    for g in ordered_targets:
+        mask = np.array([pg == g for pg in primary_genres])
+        if mask.any():
+            pts = latent_2d[mask]
+            ax.scatter(pts[:, 0], pts[:, 1], c=[genre_colors[g]], s=30, alpha=0.7, label=g)
+
+    ax.set_xlabel('t-SNE Component 1', fontsize=32)
+    ax.set_ylabel('t-SNE Component 2', fontsize=32)
+    ax.tick_params(axis='both', which='major', labelsize=24)
+    ax.legend(loc='upper right', fontsize=16, frameon=True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'latent_tsne_movies_top10.pdf'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"\n✅ t-SNE (10 genres) saved to {os.path.join(output_dir, 'latent_tsne_movies_top10.pdf')}")
+
+
+@torch.no_grad()
+def qualitative_latent_analysis_wd_movies_with_vocab(
+    model,
+    vocabs: Dict[str, Dict],
+    output_dir: str = "figures",
+    n_samples: int = 500,
+    use_all_test: bool = False,
+    device: str = None,
+):
+    """Replicate the original wd-movies qualitative analysis while relying on checkpoint vocabs.
+
+    Generates the three legacy PDFs (latent_tsne_movies.pdf, latent_interpolation.pdf,
+    interpolation_sequence.pdf) and then invokes ``qualitative_latent_analysis_wd_movies``
+    to add the canonical top-10 genre visualization (latent_tsne_movies_top10.pdf).
+    """
+
+    if vocabs is None:
+        raise ValueError("qualitative_latent_analysis_wd_movies_with_vocab requires checkpoint vocabs.")
+
+    required_keys = ("e2i", "i2e", "r2i", "i2r")
+    missing = [k for k in required_keys if k not in vocabs or vocabs[k] is None]
+    if missing:
+        raise KeyError(f"Checkpoint vocabs missing keys: {missing}")
+
+    e2i = vocabs["e2i"]
+    i2e = vocabs["i2e"]
+    r2i = vocabs["r2i"]
+    i2r = vocabs["i2r"]
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    model_unwrapped = model.module if isinstance(model, nn.DataParallel) else model
+    config = model_unwrapped.config
+    seq_len = config["seq_len"]
+    special_tokens = config["special_tokens"]
+    entity_base_idx = config["ENT_BASE"]
+    relation_base_idx = config["REL_BASE"]
+
+    if device is None:
+        device = next(model_unwrapped.parameters()).device
+
+    _, _, test_list = load_graphs_with_checkpoint_vocab("wd-movies", e2i, r2i)
+
+    if use_all_test:
+        test_sample = test_list
+    else:
+        test_sample = test_list[:min(n_samples, len(test_list))]
+
+    if len(test_sample) == 0:
+        print("Warning: wd-movies test split is empty after vocabulary filtering.")
+        return
+
+    target_genres = [
+        'Action film',
+        'Comedy film',
+        'Drama film',
+        'Horror film',
+        'Romance film',
+        'Musical film',
+        'Science fiction film',
+        'Western film',
+        'Bollywood',
+        'Documentary film',
+    ]
+
+    target_lookup = {genre.lower(): genre for genre in target_genres}
+
+    distinct_colors = [
+        '#FF0000',
+        '#FFD700',
+        '#0000FF',
+        '#000000',
+        '#FF69B4',
+        '#FF8C00',
+        '#00FF00',
+        '#8B4513',
+        '#9370DB',
+        '#00CED1',
+    ]
+
+    genre_colors = {genre: color for genre, color in zip(target_genres, distinct_colors)}
+    genre_colors['other'] = '#C0C0C0'
+
+    def extract_genres_from_graph(graph_triples: List[Tuple[str, str, str]]) -> List[str]:
+        genres = []
+        for _, r, t in graph_triples:
+            relation = (r or "").lower()
+            if 'has_genre' in relation or relation == 'genre':
+                genre = (t or '').strip()
+                if genre and genre not in genres:
+                    genres.append(genre)
+        return genres
+
+    def get_primary_genre(genres: List[str]) -> str:
+        for genre in genres:
+            canonical = target_lookup.get(genre.lower())
+            if canonical:
+                return canonical
+        return 'other'
+
+    latent_vectors = []
+    all_genres_list = []
+    primary_genres = []
+    kept_indices = []  
+
+
+    for graph_idx, graph in enumerate(test_sample):
+        if not graph:
+            continue
+
+        max_triples = config.get('max_edges', 100)
+        graph_tensor = torch.zeros((1, max_triples, 3), dtype=torch.long, device=device)
+        num_triples = min(len(graph), max_triples)
+
+        for i in range(num_triples):
+            triple = graph[i]
+            if len(triple) == 3:
+                graph_tensor[0, i, 0] = triple[0]
+                graph_tensor[0, i, 1] = triple[1]
+                graph_tensor[0, i, 2] = triple[2]
+
+        pad_rid = config.get('pad_rid', 0)
+        if num_triples < max_triples:
+            graph_tensor[0, num_triples:, 1] = pad_rid
+
+        try:
+            _, mu, _ = model_unwrapped.enc(graph_tensor)
+        except Exception as exc:
+            print(f"Skipping graph {graph_idx} during encoding: {exc}")
+            continue
+
+        latent_vectors.append(mu[0].cpu().numpy())
+        kept_indices.append(graph_idx)  
+
+
+        graph_labels = ints_to_labels([graph], i2e, i2r)[0]
+        raw_genres = extract_genres_from_graph(graph_labels)
+        all_genres_list.append(raw_genres)
+        primary_genres.append(get_primary_genre(raw_genres))
+
+    if len(latent_vectors) == 0:
+        print("Warning: No wd-movies graphs could be encoded with the checkpoint vocabulary.")
+        return
+
+    latent_vectors = np.vstack(latent_vectors)
+
+    tsne = TSNE(
+        n_components=2,
+        perplexity=max(5, min(30, len(latent_vectors) - 1)),
+        random_state=42,
+        max_iter=1000
+    )
 
     latent_2d = tsne.fit_transform(latent_vectors)
 
-    # plot t-SNE with actual genre colors
-    print("\n=== Generating t-SNE visualization ===")
-    fig1, ax1 = plt.subplots(figsize=(10, 10))  # Square figure
-    
-    # Plot points for each target genre
+
+    fig1, ax1 = plt.subplots(figsize=(10, 10))
     for genre in target_genres:
-        mask = [g == genre for g in primary_genres]
+        mask = [pg == genre for pg in primary_genres]
         if any(mask):
             points = latent_2d[mask]
-            ax1.scatter(points[:, 0], points[:, 1], 
-                       c=genre_colors[genre], 
-                       label=genre, 
-                       alpha=0.7, 
-                       s=50,
-                       edgecolors='white',
-                       linewidth=0.5)
-    
-    # Plot 'other' genres
-    other_mask = [g == 'other' for g in primary_genres]
+            ax1.scatter(
+                points[:, 0],
+                points[:, 1],
+                c=genre_colors[genre],
+                label=genre.title(),
+                alpha=0.7,
+                s=50,
+                edgecolors='white',
+                linewidth=0.5,
+            )
+
+    other_mask = [pg == 'other' for pg in primary_genres]
     if any(other_mask):
         points = latent_2d[other_mask]
-        ax1.scatter(points[:, 0], points[:, 1], 
-                   c=genre_colors['other'], 
-                   label='Other genres', 
-                   alpha=0.3, 
-                   s=20)
-    
-    ax1.set_xlabel('t-SNE Component 1', fontsize=40)  # Much larger axis labels
-    ax1.set_ylabel('t-SNE Component 2', fontsize=40)  # Much larger axis labels
-    
-    # Increase tick label size
+        ax1.scatter(
+            points[:, 0],
+            points[:, 1],
+            c=genre_colors['other'],
+            label='Other genres',
+            alpha=0.3,
+            s=20,
+        )
+
+    ax1.set_xlabel('t-SNE Component 1', fontsize=32)
+    ax1.set_ylabel('t-SNE Component 2', fontsize=32)
     ax1.tick_params(axis='both', which='major', labelsize=14)
-    
-    # Legend inside the plot (upper right corner)
-    legend = ax1.legend(loc='upper right', 
-                       frameon=True, fancybox=True, shadow=True,
-                       fontsize=25, framealpha=0.95)
+    legend = ax1.legend(
+        loc='upper right',
+        frameon=True,
+        fancybox=True,
+        shadow=True,
+        fontsize=16,
+        framealpha=0.95,
+    )
     legend.get_frame().set_facecolor('white')
     legend.get_frame().set_edgecolor('gray')
-    
-    # Make the plot square with equal aspect ratio
     ax1.set_aspect('equal', adjustable='box')
-    
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'latent_tsne_movies.pdf'), dpi=300, bbox_inches='tight')
     plt.close()
 
-    print("\n=== Generating interpolation path visualization ===")
-    
-    # find two movies with different target genres
     genre_pairs = []
     for i, genres_i in enumerate(all_genres_list):
-        for j, genres_j in enumerate(all_genres_list[i+1:], i+1):
-            # Check if both have target genres and they're different
+        for j, genres_j in enumerate(all_genres_list[i + 1:], i + 1):
             target_i = [g for g in genres_i if g in target_genres]
             target_j = [g for g in genres_j if g in target_genres]
-            
             if target_i and target_j and set(target_i).isdisjoint(set(target_j)):
                 genre_pairs.append((i, j, target_i[0], target_j[0]))
-                if len(genre_pairs) >= 5:  # Get a few pairs to choose from
+                if len(genre_pairs) >= 5:
                     break
         if len(genre_pairs) >= 5:
             break
-    
-    if len(genre_pairs) > 0:
-        # select first pair with different genres
+
+    if genre_pairs:
         idx1, idx2, genre1, genre2 = genre_pairs[0]
-        print(f"Interpolating between {genre1} and {genre2}")
-        
+        print(f"Interpolating between {genre1.title()} and {genre2.title()}")
+
         z1 = torch.tensor(latent_vectors[idx1], device=device, dtype=torch.float32)
         z2 = torch.tensor(latent_vectors[idx2], device=device, dtype=torch.float32)
-        
-        # generate interpolation path
+
         n_interp_points = 20
         alphas = np.linspace(0, 1, n_interp_points)
-        interp_points = []
-        
-        for alpha in alphas:
-            z_alpha = (1 - alpha) * z1 + alpha * z2
-            interp_points.append(z_alpha.cpu().numpy())
-        
-        interp_points = np.vstack(interp_points)
-        
-        # project interpolation path to 2D using existing t-SNE model
-        # note: This is an approximation; proper way would be to retrain t-SNE
-        interp_2d = tsne.fit_transform(np.vstack([latent_vectors, interp_points]))
-        
-        fig2, ax2 = plt.subplots(figsize=(10, 10))  # Square figure
+        interp_points = np.vstack([
+            ((1 - alpha) * z1 + alpha * z2).cpu().numpy() for alpha in alphas
+        ])
 
-        ax2.scatter(interp_2d[:len(latent_vectors), 0], 
-                   interp_2d[:len(latent_vectors), 1], 
-                   c='lightgray', alpha=0.3, s=10)
-        
-        # plot interpolation path
+        interp_2d = tsne.fit_transform(np.vstack([latent_vectors, interp_points]))
         path_2d = interp_2d[len(latent_vectors):]
+
+        fig2, ax2 = plt.subplots(figsize=(10, 10))
+        ax2.scatter(
+            interp_2d[:len(latent_vectors), 0],
+            interp_2d[:len(latent_vectors), 1],
+            c='lightgray',
+            alpha=0.3,
+            s=10,
+        )
         ax2.plot(path_2d[:, 0], path_2d[:, 1], 'b-', linewidth=2, alpha=0.7, label='Interpolation path')
-        ax2.scatter(path_2d[0, 0], path_2d[0, 1], c='red', s=150, marker='s', 
-                   label=f'Start: {genre1}', zorder=5, edgecolor='black')
-        ax2.scatter(path_2d[-1, 0], path_2d[-1, 1], c='blue', s=150, marker='s', 
-                   label=f'End: {genre2}', zorder=5, edgecolor='black')
-        
-        # mark intermediate points
-        for i in [5, 10, 15]:
-            ax2.scatter(path_2d[i, 0], path_2d[i, 1], c='orange', s=80, marker='o', zorder=4)
-        
-        ax2.set_xlabel('t-SNE Component 1', fontsize=40)
-        ax2.set_ylabel('t-SNE Component 2', fontsize=40)
-        
-        # Increase tick label size
+        ax2.scatter(path_2d[0, 0], path_2d[0, 1], c='red', s=150, marker='s', label=f'Start: {genre1.title()}', zorder=5, edgecolor='black')
+        ax2.scatter(path_2d[-1, 0], path_2d[-1, 1], c='blue', s=150, marker='s', label=f'End: {genre2.title()}', zorder=5, edgecolor='black')
+        for marker_idx in [5, 10, 15]:
+            if marker_idx < len(path_2d):
+                ax2.scatter(path_2d[marker_idx, 0], path_2d[marker_idx, 1], c='orange', s=80, marker='o', zorder=4)
+        ax2.set_xlabel('t-SNE Component 1', fontsize=32)
+        ax2.set_ylabel('t-SNE Component 2', fontsize=32)
         ax2.tick_params(axis='both', which='major', labelsize=14)
-        
-        # Make the plot square with equal aspect ratio
         ax2.set_aspect('equal', adjustable='box')
-        
-        # Larger legend text
-        ax2.legend(fontsize=25, loc='upper right', frameon=True, fancybox=True, 
-                  shadow=True, framealpha=0.95)
-        
+        ax2.legend(fontsize=16, loc='upper right', frameon=True, fancybox=True, shadow=True, framealpha=0.95)
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'latent_interpolation.pdf'), dpi=300, bbox_inches='tight')
         plt.close()
 
-        print("\n=== Generating interpolation sequence ===")
-        
         fig3 = plt.figure(figsize=(18, 4))
         gs = GridSpec(1, 5, figure=fig3, wspace=0.3)
-        
         alpha_points = [0.0, 0.25, 0.5, 0.75, 1.0]
-        
+
+
+        beam_width = config.get('beam_width', 3)
         for idx, alpha in enumerate(alpha_points):
             ax = fig3.add_subplot(gs[0, idx])
 
             z_alpha = (1 - alpha) * z1 + alpha * z2
-            
-            # decode to graph
             decoded_graph = decode_to_triple_set(
                 model_unwrapped, z_alpha, seq_len, special_tokens,
-                entity_base_idx, relation_base_idx, beam=1
+                entity_base_idx, relation_base_idx, beam=beam_width
             )
-            
-            # convert to labels
             decoded_labels = ints_to_labels([list(decoded_graph)], i2e, i2r)[0]
-            
-            # extract genres from decoded graph
             decoded_genres = extract_genres_from_graph(decoded_labels)
-            
-            # create a small graph visualization
+
             G = nx.DiGraph()
-            for h, r, t in decoded_labels[:6]:  # Show first 6 triples
-                # Truncate labels for display
+            for h, r, t in decoded_labels[:6]:
                 h_short = h[:15] + '...' if len(h) > 15 else h
                 t_short = t[:15] + '...' if len(t) > 15 else t
                 r_short = r[:10]
                 G.add_edge(h_short, t_short, label=r_short)
 
             pos = nx.spring_layout(G, seed=42, k=2, iterations=50)
-            nx.draw_networkx_nodes(G, pos, node_color='lightblue', 
-                                  node_size=600, ax=ax)
+            nx.draw_networkx_nodes(G, pos, node_color='lightblue', node_size=600, ax=ax)
             nx.draw_networkx_labels(G, pos, font_size=7, ax=ax)
-            nx.draw_networkx_edges(G, pos, edge_color='gray', 
-                                  arrows=True, arrowsize=10, ax=ax, width=1.5)
-
+            nx.draw_networkx_edges(G, pos, edge_color='gray', arrows=True, arrowsize=10, ax=ax, width=1.5)
             edge_labels = nx.get_edge_attributes(G, 'label')
             nx.draw_networkx_edge_labels(G, pos, edge_labels, font_size=6, ax=ax)
-
             ax.axis('off')
 
-            genres_text = ', '.join(decoded_genres[:3])  # Show up to 3 genres
+            genres_text = ', '.join(decoded_genres[:3]) if decoded_genres else 'unknown'
             if len(decoded_genres) > 3:
                 genres_text += '...'
-            ax.text(0.5, -0.15, f'Genres: {genres_text}', 
-                   transform=ax.transAxes,
-                   ha='center', fontsize=8, style='italic')
-        
+            ax.text(0.5, -0.15, f'Genres: {genres_text}', transform=ax.transAxes, ha='center', fontsize=8, style='italic')
+
+
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'interpolation_sequence.pdf'), dpi=300, bbox_inches='tight')
         plt.close()
-    
+
+
+    else:
+        print("Skipping interpolation path visualization: no suitable genre pair found.")
+
+    qualitative_latent_analysis_wd_movies(
+        model=model,
+        vocabs=vocabs,
+        output_dir=output_dir,
+        n_samples=n_samples,
+        use_all_test=use_all_test,
+        device=device,
+    )
+
     print(f"\n✅ Qualitative analysis complete. Figures saved to {output_dir}/")
     print("  - latent_tsne_movies.pdf")
-    print("  - latent_interpolation.pdf") 
+    print("  - latent_interpolation.pdf")
     print("  - interpolation_sequence.pdf")
+    print("  - latent_tsne_movies_top10.pdf")
 
 
 def main():
@@ -781,8 +915,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
-    parser.add_argument('--wandb-project', type=str, default='anonymized_project')
-    parser.add_argument('--wandb-entity', type=str, default='anonymous')
+    parser.add_argument('--wandb-project', type=str, default='submission', help='Weights & Biases project name')
+    parser.add_argument('--wandb-entity', type=str, default='a-vozikis-vrije-universiteit-amsterdam', help='W&B entity')
     parser.add_argument('--directions', type=int, default=20)
 
     parser.add_argument('--epsilon', type=float, default=0.1)
@@ -793,48 +927,52 @@ def main():
         config = yaml.safe_load(f)
 
     dataset    = config['dataset']
-    model_type = config.get('model_type', 'autoreg')
+    model_type = config.get('model_type', 'SAIL')
     device     = 'cuda' if torch.cuda.is_available() else 'cpu'
-    beam = config.get("beam_width", 1)
+    
+    beam = config.get("beam_width", 3)
 
 
     model, config, ckpt_path, vocabs, _ = load_model(
-    checkpoint_dir=args.checkpoint_dir,
-    dataset=dataset,
-    model_type=model_type,
-    epoch=args.epoch,
-    device=device,
-)
+        checkpoint_dir=args.checkpoint_dir,
+        dataset=dataset,
+        model_type=model_type,
+        epoch=args.epoch,
+        device=device,
+    )
 
-    if vocabs is not None:
-        i2e = vocabs.get('i2e')
-        i2r = vocabs.get('i2r')
-    else:
-        _, _, _, (e2i, i2e), (r2i, i2r), _, _ = load_data_as_list(dataset)
+    if vocabs is None:
+        raise KeyError("Checkpoint missing 'vocabs'; retrain and save with vocabulary mappings.")
+
+    required_vocab_keys = ("i2e", "i2r")
+    missing = [k for k in required_vocab_keys if vocabs.get(k) is None]
+    if missing:
+        raise KeyError(f"Checkpoint vocabulary missing keys: {missing}")
+
+    i2e = vocabs["i2e"]
+    i2r = vocabs["i2r"]
 
     wandb.init(
     project=args.wandb_project,
     entity=args.wandb_entity,
     config=config,
-    name=f"latent_interp_{config['dataset']}_{config.get('model_type','autoreg')}"
+    name=f"latent_interp_{config['dataset']}_{config.get('model_type','SAIL')}"
 )
 
     kind = f"epoch {args.epoch}" if args.epoch is not None else "best"
     print(f"✅ Loaded {model_type} for {dataset} ({kind}) from {ckpt_path} on {device}")
     if dataset == "wd-movies":
-        qualitative_latent_analysis_wd_movies(
+        qualitative_latent_analysis_wd_movies_with_vocab(
             model,
+            vocabs=vocabs,
             output_dir="figures",
-            n_samples=500,
-            use_all_test=False
+            n_samples=10000,
+            use_all_test=True
         )
 
-    if model_type == "autoreg":
+    if model_type == "SAIL" or model_type == "t-SAIL":
         assert i2e is not None and i2r is not None, "Checkpoint missing vocabs; retrain.py must save them."
         for e in [0.02, 0.05, 0.07, 0.1, 0.12, 0.15, 0.17, 0.2]:
-        # for i in range(2, 101, 2):
-            # e = i / 100
-            # print(e)
             print("----------------------------------------------------------------------")
             print ("epsilon value is:", e)
             print("----------------------------------------------------------------------")
