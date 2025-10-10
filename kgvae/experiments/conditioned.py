@@ -1,251 +1,294 @@
-#!/usr/bin/env python3
 import argparse
+import copy
+from pathlib import Path
+
 import torch
 import yaml
-import wandb
-from kgvae.model.models import AutoRegModel
+
+from kgvae.model.models import SAIL, ARK
 from kgvae.model.utils import seq_to_triples, ints_to_labels
-from kgvae.model.verification import get_verifier, run_semantic_evaluation
-from intelligraphs.data_loaders import load_data_as_list
 
 
-def load_model(ckpt_path, device):
-    ckpt = torch.load(ckpt_path, map_location=device)
+CONDITION_RELATION = "has_director"
+CONDITION_OBJECT = "Tim Burton"
+
+
+def load_checkpoint(path, device):
+    ckpt = torch.load(path, map_location=device)
     config = ckpt["config"]
     state = ckpt["model_state_dict"]
     if any(k.startswith("module.") for k in state):
         state = {k.replace("module.", "", 1): v for k, v in state.items()}
-    vocabs = ckpt.get("vocabs", None)
+    vocabs = ckpt.get("vocabs")
     if vocabs is None:
-        raise RuntimeError("Checkpoint missing 'vocabs' (expected keys: e2i, i2e, r2i, i2r).")
+        raise KeyError(f"Checkpoint {path} is missing 'vocabs'.")
     return config, state, vocabs
 
-def build_model(config, state, device):
-    ''' Build model from config and load state dict. '''
-    
-    needed = ["vocab_size","seq_len","special_tokens","ENT_BASE","REL_BASE",
-              "n_entities","n_relations","d_latent"]
-    missing = [k for k in needed if k not in config]
-    if missing:
-        raise RuntimeError(f"Checkpoint config missing keys: {missing}")
-    model = AutoRegModel(config).to(device)
+
+def normalize_config(config, model_type_override=None):
+    cfg = copy.deepcopy(config)
+    raw_type = model_type_override or cfg.get("model_type", "ARK")
+    raw_type = str(raw_type)
+    lower = raw_type.lower()
+
+    if lower in {"sail", "autoreg", "autoregressive"}:
+        resolved = "SAIL"
+    elif lower in {"t-sail", "tsail"}:
+        resolved = "t-SAIL"
+    elif lower in {"ark"}:
+        resolved = "ARK"
+    elif lower in {"t-ark", "tark"}:
+        resolved = "t-ARK"
+    elif lower == "dec_only":
+        decoder = str(cfg.get("ablation_decoder", "Transformer")).lower()
+        resolved = "ARK" if decoder == "gru" else "t-ARK"
+    else:
+        raise ValueError(f"Unsupported model_type '{raw_type}'.")
+
+    cfg["model_type"] = resolved
+    return cfg, resolved
+
+
+def resolve_model_variant(config, raw_type=None):
+    """Return canonical model string without mutating the original config."""
+    _, resolved = normalize_config(config, raw_type)
+    return resolved
+
+
+def build_model(config, state, device, model_type_override=None):
+    cfg, resolved = normalize_config(config, model_type_override)
+    if resolved in {"SAIL", "t-SAIL"}:
+        model = SAIL(cfg).to(device)
+        model_kind = "autoreg"
+    elif resolved in {"ARK", "t-ARK"}:
+        model = ARK(cfg).to(device)
+        model_kind = "decoder_only"
+    else:
+        raise ValueError(f"Unhandled resolved model type '{resolved}'.")
     model.load_state_dict(state, strict=True)
     model.eval()
-    return model
-
-def get_logits_fn(model):
-    def fn(z, prefix_ids):
-        out = model.dec(z, prefix_ids)   
-        return out[:, -1, :]             
-    return fn
-
-def force_token(logits, forced_id):
-    """Replace distribution by a delta on forced_id."""
-    out = torch.full_like(logits, float('-inf'))
-    out[..., forced_id] = 0.0
-    return out
+    return model, cfg, model_kind
 
 
-def ids_for_labels(relation_label, object_label, r2i, e2i, REL_BASE, ENT_BASE):
-    if relation_label not in r2i:
-        raise SystemExit(f"Unknown relation label: {relation_label}")
-    if object_label  not in e2i:
-        raise SystemExit(f"Unknown entity label: {object_label}")
-    rid = r2i[relation_label] + REL_BASE
-    oid = e2i[object_label]  + ENT_BASE
+def force_token(logits, token_id):
+    forced = torch.full_like(logits, float('-inf'))
+    forced[..., token_id] = 0.0
+    return forced
+
+
+def sample_from_logits(logits, temperature=1.0, top_p=0.0, top_k=0):
+    if temperature and temperature != 1.0:
+        logits = logits / float(temperature)
+
+    probs = torch.softmax(logits, dim=-1)
+
+    vocab_size = probs.size(-1)
+    if top_k and top_k > 0 and top_k < vocab_size:
+        top_values, top_indices = probs.topk(top_k, dim=-1)
+        mask = torch.zeros_like(probs)
+        mask.scatter_(-1, top_indices, 1.0)
+        probs = probs * mask
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    if top_p and 0.0 < top_p < 1.0:
+        sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)
+        cumulative = sorted_probs.cumsum(dim=-1)
+        cutoff = cumulative > top_p
+        cutoff[..., 1:] = cutoff[..., :-1].clone()
+        cutoff[..., 0] = False
+        sorted_probs = sorted_probs.masked_fill(cutoff, 0.0)
+        sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        sampled_idx = torch.multinomial(sorted_probs, 1)
+        next_tokens = torch.gather(sorted_idx, -1, sampled_idx)
+    else:
+        next_tokens = torch.multinomial(probs, 1)
+
+    return next_tokens
+
+
+@torch.no_grad()
+def conditional_generate(model, model_kind, cfg, forced_relation_id, forced_object_id,
+                         num_samples, device):
+    special_tokens = cfg["special_tokens"]
+    seq_len = cfg["seq_len"]
+    bos = special_tokens["BOS"]
+    eos = special_tokens["EOS"]
+
+    seq = torch.full((num_samples, 1), bos, dtype=torch.long, device=device)
+
+    if model_kind == "autoreg":
+        latent_dim = cfg["d_latent"]
+        z = torch.randn(num_samples, latent_dim, device=device)
+        def next_logits(prefix):
+            return model.dec(z, prefix)[:, -1, :]
+    else:
+        def next_logits(prefix):
+            return model(prefix)[:, -1, :]
+
+    decoder_sample = False
+    temperature = cfg.get("temperature", 1.0)
+    top_p = cfg.get("top_p", 0.0)
+    top_k = cfg.get("top_k", 0)
+    if model_kind == "decoder_only":
+        decoder_sample = bool(
+            cfg.get("sample", True)
+            or (top_p and top_p > 0.0)
+            or (top_k and top_k > 0)
+            or (temperature and temperature != 1.0)
+        )
+
+    while seq.size(1) < seq_len:
+        logits = next_logits(seq)
+        step = seq.size(1)
+        if step == 2:
+            logits = force_token(logits, forced_relation_id)
+        elif step == 3:
+            logits = force_token(logits, forced_object_id)
+        if decoder_sample:
+            next_token = sample_from_logits(logits, temperature=temperature, top_p=top_p, top_k=top_k)
+        else:
+            next_token = logits.argmax(dim=-1, keepdim=True)
+        seq = torch.cat([seq, next_token], dim=1)
+        if (seq[:, -1] == eos).all():
+            break
+
+    return seq.cpu()
+
+
+def ids_for_condition(vocabs, cfg, relation_label, object_label):
+    e2i = vocabs.get("e2i")
+    r2i = vocabs.get("r2i")
+    if e2i is None or r2i is None:
+        raise KeyError("Checkpoint vocabs require 'e2i' and 'r2i'.")
+    try:
+        rid = r2i[relation_label] + cfg["REL_BASE"]
+    except KeyError as err:
+        raise KeyError(f"Relation '{relation_label}' not found in checkpoint vocab.") from err
+    try:
+        oid = e2i[object_label] + cfg["ENT_BASE"]
+    except KeyError as err:
+        raise KeyError(f"Entity '{object_label}' not found in checkpoint vocab.") from err
     return rid, oid
 
-@torch.no_grad()
-def conditional_decode(
-    model,
-    num_samples,
-    seq_len,
-    special_tokens,
-    d_latent,
-    force_rid,       
-    force_oid,     
-    device="cuda",
-):
-    """
-    conditional greedy generation:
-      - sample z ~ N(0, I)
-      - decode from BOS
-      - at t==2 force r1 == force_rid
-      - at t==3 force o1 == force_oid
-      - otherwise greedy argmax until EOS or seq_len
-    """
-    BOS = special_tokens["BOS"]
-    EOS = special_tokens["EOS"]
 
-    z = torch.randn(num_samples, d_latent, device=device)
-
-    logits_fn = get_logits_fn(model)
-    seq = torch.full((num_samples, 1), BOS, dtype=torch.long, device=device)
-
-    while seq.size(1) < seq_len:
-        t = seq.size(1) 
-        logits_next = logits_fn(z, seq) 
-
-        if t == 2:
-            logits_next = force_token(logits_next, force_rid)  
-        elif t == 3:
-            logits_next = force_token(logits_next, force_oid)  
-
-        next_ids = torch.argmax(logits_next, dim=-1, keepdim=True)
-        seq = torch.cat([seq, next_ids], dim=1)
-
-        if (seq[:, -1] == EOS).all():
-            break
-
-    return seq
+def to_labeled_triples(seqs, cfg, vocabs):
+    special_tokens = cfg["special_tokens"]
+    ent_base = cfg["ENT_BASE"]
+    rel_base = cfg["REL_BASE"]
+    graphs = [seq_to_triples(seq, special_tokens, ent_base, rel_base) for seq in seqs]
+    i2e = vocabs.get("i2e")
+    i2r = vocabs.get("i2r")
+    if i2e is None or i2r is None:
+        raise KeyError("Checkpoint vocabs require 'i2e' and 'i2r' for decoding.")
+    return ints_to_labels(graphs, i2e, i2r)
 
 
-@torch.no_grad()
-def unconditional_decode(
-    model,
-    num_samples,
-    seq_len,
-    special_tokens,
-    d_latent,
-    device="cuda",
-    beam=1,  
-):
-    """
-    Unconditional greedy generation:
-      1) sample z ~ N(0, I)
-      2) decode from BOS until EOS or seq_len
-    Returns:
-      LongTensor of token ids with shape (num_samples, T<=seq_len)
-    """
-    BOS = special_tokens["BOS"]
-    EOS = special_tokens["EOS"]
-
-    z = torch.randn(num_samples, d_latent, device=device)
-    logits_fn = get_logits_fn(model)  
-    seq = torch.full((num_samples, 1), BOS, dtype=torch.long, device=device)
-
-    while seq.size(1) < seq_len:
-        logits_next = logits_fn(z, seq)                
-        next_ids = torch.argmax(logits_next, dim=-1)  
-        seq = torch.cat([seq, next_ids.unsqueeze(-1)], dim=1)
-        if (seq[:, -1] == EOS).all():
-            break
-
-    return seq
+def discover_checkpoints(explicit, checkpoint_dir):
+    if explicit:
+        return [Path(p) for p in explicit]
+    directory = Path(checkpoint_dir)
+    if not directory.exists():
+        return []
+    return sorted(directory.glob("*.pt"))
 
 
 def main():
-    parser = argparse.ArgumentParser("Constrained first (relation, object) decoding")
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--relation", required=True, help="e.g., has_actor")
-    parser.add_argument("--object",   required=True, help="e.g., Al Pacino")
-    parser.add_argument("--num-samples", type=int, default=8)
-    parser.add_argument('--wandb-project', type=str, default='anonymized_project')
-    parser.add_argument('--wandb-entity', type=str, default='anonymous')
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--dataset", required=True, help="IntelliGraphs dataset name, e.g., wd-movies")
-
+    parser = argparse.ArgumentParser("Conditioned decoding for WD Movies")
+    parser.add_argument('--config', type=str, required=True, help='Path to config YAML file.')
+    parser.add_argument('--checkpoints', nargs='+', default=None, help='One or more checkpoint files to load.')
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints', help='Fallback directory to scan for checkpoints.')
+    parser.add_argument('--num-samples', type=int, default=4, help='Number of graphs to generate per checkpoint.')
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--relation', type=str, default=CONDITION_RELATION, help='Relation label to force in the first triple.')
+    parser.add_argument('--tail', type=str, default=CONDITION_OBJECT, help='Tail entity label to force in the first triple.')
+    parser.add_argument('--dataset', type=str, default=None, help='Dataset name used to filter checkpoints (overrides config).')
+    parser.add_argument('--model-type', type=str, default=None, choices=['SAIL', 't-SAIL', 'ARK', 't-ARK'], help='Override model type if checkpoint config is ambiguous.')
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
-    config, state, vocabs = load_model(args.checkpoint, device)
-    model = build_model(config, state, device)
+    with open(args.config, 'r') as f:
+        cfg_file = yaml.safe_load(f)
+    expected_dataset = cfg_file.get('dataset')
+    config_model_type = cfg_file.get('model_type')
 
-    i2e, i2r = vocabs["i2e"], vocabs["i2r"]
-    e2i, r2i = vocabs["e2i"], vocabs["r2i"]
-    special_tokens = config["special_tokens"]
-    ENT_BASE = config["ENT_BASE"]
-    REL_BASE = config["REL_BASE"]
-    seq_len = config["seq_len"]
-    d_latent = config["d_latent"]
-    verifier = get_verifier(args.dataset)
-    train_g, _, _, i2e_data, i2r_data, e2i_data, r2i_data = load_data_as_list(args.dataset)
-    wandb.init(
-    project=args.wandb_project,
-    entity=args.wandb_entity,
-    config=config,
-    name=f"latent_interp_{config['dataset']}_{config.get('model_type','autoreg')}"
-)
+    dataset_filter = args.dataset or expected_dataset
+    model_type_override = args.model_type or config_model_type
+
+    checkpoints = discover_checkpoints(args.checkpoints, args.checkpoint_dir)
+    if not checkpoints:
+        raise SystemExit("No checkpoints found. Provide --checkpoints or populate the checkpoint directory.")
+
+    for ckpt_path in checkpoints:
+        config, state, vocabs = load_checkpoint(ckpt_path, device)
+        dataset = config.get("dataset")
+        if dataset_filter and dataset != dataset_filter:
+            print(f"Skipping {ckpt_path} (dataset={dataset}).")
+            continue
+
+        try:
+            resolved_checkpoint_type = resolve_model_variant(config)
+        except ValueError as err:
+            print(f"Skipping {ckpt_path}: {err}")
+            continue
+
+        override_choice = model_type_override
+        if override_choice is not None:
+            try:
+                resolved_override = resolve_model_variant(config, override_choice)
+            except ValueError as err:
+                print(f"Warning: override '{override_choice}' invalid for {ckpt_path} ({err}); using checkpoint model type instead.")
+                override_choice = None
+            else:
+                if resolved_override != resolved_checkpoint_type:
+                    print(f"Warning: override '{override_choice}' mapped to {resolved_override} but checkpoint is {resolved_checkpoint_type}; using checkpoint model type.")
+                    override_choice = None
+
+        try:
+            model, cfg, model_kind = build_model(config, state, device, override_choice)
+        except ValueError as err:
+            print(f"Skipping {ckpt_path}: {err}")
+            continue
+
+        required_special = {"PAD", "BOS", "EOS"}
+        special_tokens = cfg.get("special_tokens", {})
+        if not required_special.issubset(special_tokens):
+            missing = required_special.difference(special_tokens)
+            print(f"Skipping {ckpt_path}: missing special tokens {sorted(missing)}")
+            continue
+
+        try:
+            forced_relation_id, forced_object_id = ids_for_condition(vocabs, cfg, args.relation, args.tail)
+        except KeyError as err:
+            print(f"Skipping {ckpt_path}: {err}")
+            continue
+
+        seqs = conditional_generate(
+            model=model,
+            model_kind=model_kind,
+            cfg=cfg,
+            forced_relation_id=forced_relation_id,
+            forced_object_id=forced_object_id,
+            num_samples=args.num_samples,
+            device=device,
+        )
+
+        if isinstance(model, torch.nn.Module):
+            model.to("cpu")
+
+        labeled = to_labeled_triples(seqs, cfg, vocabs)
+        print("\n===", ckpt_path, "===")
+        for idx, triples in enumerate(labeled, start=1):
+            print(f"[{idx}]")
+            if not triples:
+                print("  (empty graph)")
+                continue
+            for triple in triples:
+                print("  ", triple)
+        print("---")
 
 
-    # ---------- Constrained generation ----------
-    force_rid, force_oid = ids_for_labels(args.relation, args.object, r2i, e2i, REL_BASE, ENT_BASE)
-
-    z = torch.randn(args.num_samples, d_latent, device=device)
-    
-    print("----------------------------------------------")
-    force_rid, force_oid = ids_for_labels(args.relation, args.object, r2i, e2i, REL_BASE, ENT_BASE)
-
-    seq_constrained = conditional_decode(
-        model=model,
-        num_samples=args.num_samples,
-        seq_len=seq_len,
-        special_tokens=special_tokens,
-        d_latent=d_latent,
-        force_rid=force_rid,
-        force_oid=force_oid,
-        device=device,
-    )
-
-    print("\n=== Constrained samples ===")
-    triples_per_graph = []
-    for s in seq_constrained.tolist():
-        g = seq_to_triples(s, special_tokens, ENT_BASE, REL_BASE)
-        labeled = ints_to_labels([g], i2e, i2r)[0]
-        triples_per_graph.append(labeled)
-
-    for i, triples in enumerate(triples_per_graph, 1):
-        print(f"\n[{i}] Triples (labels):")
-        for t in triples:
-            print("  ", t)
-        print("-" * 60)
-        
-    print("\n=== Conditioned semantic evaluation ===")
-    run_semantic_evaluation(
-        triples_per_graph,  
-        train_g,             
-        i2e, i2r,            
-        verifier,           
-        title="graphs conditioned on (relation, object)"
-    )
-
-    # ---------- Unconditional generation (added here) ----------
-    seq_uncond = unconditional_decode(
-        model=model,
-        num_samples=args.num_samples,
-        seq_len=seq_len,
-        special_tokens=special_tokens,
-        d_latent=d_latent,
-        device=device,
-        beam=4
-    )
-
-    print("\n=== Unconditional samples ===")
-    triples_per_graph_uncond = []
-    for s in seq_uncond.tolist():
-        g = seq_to_triples(s, special_tokens, ENT_BASE, REL_BASE)
-        labeled = ints_to_labels([g], i2e, i2r)[0]
-        triples_per_graph_uncond.append(labeled)
-
-    for i, triples in enumerate(triples_per_graph_uncond, 1):
-        print(f"\n[{i}] Triples (labels):")
-        for t in triples:
-            print("  ", t)
-        print("-" * 60)
-        
-    print("\n=== Unconditioned semantic evaluation ===")
-    run_semantic_evaluation(
-        triples_per_graph_uncond,
-        train_g,
-        i2e, i2r,
-        verifier,
-        title="graphs from random latent (unconditional)"
-    )
-
-    wandb.finish()
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

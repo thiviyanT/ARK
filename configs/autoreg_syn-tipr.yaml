@@ -2,16 +2,17 @@
 
 
 #Model architecture
-model_type: dec_only #can be autoreg or dec_only. The autoreg model uses the variational autoencoder architecture while the dec_only model uses a decoder-only architecture.
-d_model: 512
+model_type: ARK #can be ARK or t-ARK, SAIL or t-SAIL
+d_model: 1024
 d_latent: 32
 n_heads: 16
-n_layers: 1
+n_layers: 3
 
 #Training parameters
 batch_size: 256
 learning_rate: 0.0001
-num_epochs: 300
+# num_epochs: 200
+num_epochs: 100
 beta0: 0.1
 beta1: 1.0
 
@@ -31,21 +32,16 @@ beam_width: 4
 
 #Optimization settings
 lr_scheduler: true
-save_every: 50
+save_every: 100
 resume_from_checkpoint: false
-checkpoint_path: checkpoints/autoreg_syn_tipr.pt
+checkpoint_path: checkpoints2/tipr/dec_only/GRU/autoreg_syn_tipr.pt
 
 #Experiment tracking
-experiment_name: autoreg_vae_syn_tipr_dec_only
-verify_every: 10
+experiment_name: autoreg_vae_syn_tipr_dec_only_TRF
+verify_every: 25
 
 #Evaluation settings
 use_test_for_final_eval: true  
 
 #Compression bits estimation
-compression_log_every: 10  
-
-#ablation study settings
-#set to None if no ablation is needed
-# ablation_encoder: MLP 
-ablation_decoder: GRU #this can be used for both the autoreg and dec_only models. In both cases the GRU decoder is used.
+compression_log_every: 25

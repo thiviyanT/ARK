@@ -1,11 +1,11 @@
 # Configuration for training an autoregressive model on WD articles dataset
 
 # Model architecture
-model_type: autoreg #can be autoreg or dec_only. The autoreg model uses the variational autoencoder architecture while the dec_only model uses a decoder-only architecture.
+model_type: ARK #can be ARK or t-ARK, SAIL or t-SAIL
 d_model: 512
 d_latent: 128
 n_heads: 8
-n_layers: 12
+n_layers: 3
 
 # Training parameters
 batch_size: 16
@@ -36,15 +36,10 @@ checkpoint_path: checkpoints/autoreg_wd_articles.pt
 
 # Experiment tracking
 experiment_name: autoreg_vae_wd_articles
-verify_every: 20
+verify_every: 25
 
 # Evaluation settings
 use_test_for_final_eval: true  
 
 #Compression bits estimation
-compression_log_every: 20
-
-#ablation study settings
-#set to None if no ablation is needed
-# ablation_encoder: MLP 
-ablation_decoder: GRU #this can be used for both the autoreg and dec_only models. In both cases the GRU decoder is used.
+compression_log_every: 25

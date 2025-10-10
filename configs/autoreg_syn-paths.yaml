@@ -1,17 +1,17 @@
 # Configuration for training an autoregressive model on synthetic paths dataset
 
 #Model architecture
-model_type: dec_only #can be autoreg or dec_only. The autoreg model uses the variational autoencoder architecture while the dec_only model uses a decoder-only architecture.
+model_type: ARK #can be ARK or t-ARK, SAIL or t-SAIL
 
 d_model: 512  
 d_latent: 10
 n_heads: 4
-n_layers: 2
+n_layers: 3
 
 #Training parameters
 batch_size: 256
 learning_rate: 0.0001
-num_epochs: 300
+num_epochs: 100
 beta0: 0.1
 beta1: 1.0
 
@@ -33,19 +33,14 @@ beam_width: 4
 lr_scheduler: true
 save_every: 50
 resume_from_checkpoint: false
-checkpoint_path: checkpoints/autoreg_syn_paths.pt 
+checkpoint_path: checkpoints2/autoreg_syn_paths.pt 
 
 #Experiment tracking
-verify_every: 10
-experiment_name: autoreg_vae_syn_paths_dec_only_GRU
+verify_every: 25
+experiment_name: autoreg_vae_syn_paths_dec_only_TRF
 
 #Evaluation settings
 use_test_for_final_eval: true  
 
 #Compression bits estimation
-compression_log_every: 10
-
-#ablation study settings
-#set to None if no ablation is needed
-# ablation_encoder: MLP 
-ablation_decoder: GRU #this can be used for both the autoreg and dec_only models. In both cases the GRU decoder is used.
+compression_log_every: 25
