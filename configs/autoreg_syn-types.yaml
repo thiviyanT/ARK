@@ -2,6 +2,7 @@
 
 #Model architecture
 model_type: ARK #can be ARK or t-ARK, SAIL or t-SAIL
+d_model: 1024
 d_latent: 24
 n_heads: 4
 n_layers: 3
